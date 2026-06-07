@@ -35,6 +35,7 @@ Repo đã có `render.yaml`, gồm:
 - Web service FastAPI
 - Supabase Postgres để lưu metadata job/pair
 - Cloudinary để lưu ảnh LOW/HIGH final lâu dài
+- Python pinned ở `3.11.9` qua `PYTHON_VERSION` và `.python-version`
 
 Render free không hỗ trợ persistent disk, nên app dùng `web_platform/web_data` làm nơi xử lý tạm. Sau khi lưu cặp đã duyệt, ảnh final được upload lên Cloudinary và file tạm có thể được cleanup.
 
