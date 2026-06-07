@@ -2,9 +2,12 @@ import os
 import json
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, Text, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy import inspect, text
+
+load_dotenv()
 
 # Resolve DATA_DIR locally to avoid circular imports with app.py
 BASE_DIR = Path(__file__).resolve().parent
@@ -12,9 +15,11 @@ DATA_DIR = BASE_DIR / "web_data"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
-    # Render PostgreSQL provides url starting with postgres://, but SQLAlchemy requires postgresql://
+    # Normalize hosted Postgres URLs and use psycopg v3 instead of psycopg2.
     if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+    elif DATABASE_URL.startswith("postgresql://"):
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 else:
     # Fallback to local SQLite database in web_data

@@ -5,6 +5,10 @@ import tempfile
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 def first_env(*keys: str) -> str | None:
     for key in keys:

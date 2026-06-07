@@ -10,7 +10,7 @@ services:
       - key: PYTHONUNBUFFERED
         value: "true"
       - key: PYTHON_VERSION
-        value: "3.11.9"
+        value: "3.11.15"
       - key: CLOUDINARY_CLOUD_NAME
         sync: false
       - key: CLOUDINARY_API_KEY
