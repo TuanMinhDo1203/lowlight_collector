@@ -9,7 +9,7 @@ Luồng sử dụng:
 3. Review các cặp LOW/HIGH được chọn tự động.
 4. Nếu cặp chưa đúng, đổi **Frame LOW** hoặc **Frame HIGH** bằng dropdown.
 5. Dùng **Thêm cặp thủ công** nếu pipeline bỏ sót một cặp tốt.
-6. Loại cặp xấu hoặc lưu các cặp đã duyệt vào `web_data/selected_dataset`.
+6. Loại cặp xấu hoặc lưu các cặp đã duyệt.
 
 Hướng dẫn tham số chi tiết nằm ở `WEB_USAGE_GUIDE.md`.
 
@@ -38,10 +38,20 @@ http://YOUR_LOCAL_IP:8000
 
 Nếu không cùng mạng, dùng private tunnel như Tailscale hoặc Cloudflare Tunnel và trỏ vào port `8000`.
 
-Các cặp đã chọn được lưu vào:
+Nếu chạy local hoặc chưa cấu hình Cloudinary, các cặp đã chọn được lưu vào:
 
 ```text
 web_data/selected_dataset/low
 web_data/selected_dataset/high
 web_data/selected_dataset/metadata/reviewed_pairs.csv
 ```
+
+Khi deploy Render free với Cloudinary, ảnh LOW/HIGH final được upload lên Cloudinary theo folder:
+
+```text
+lowlight_datasets/<job_id>/low
+lowlight_datasets/<job_id>/high
+lowlight_datasets/<job_id>/metadata/reviewed_pairs.csv
+```
+
+Supabase Postgres lưu metadata gồm `job_id`, `submitted_by`, đường dẫn ảnh gốc tạm thời và URL Cloudinary đã lưu.

@@ -5,3 +5,4 @@ opencv-python-headless==4.10.0.84
 numpy==2.2.1
 SQLAlchemy==2.0.30
 psycopg2-binary==2.9.9
+cloudinary==1.41.0

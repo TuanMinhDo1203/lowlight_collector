@@ -6,16 +6,16 @@ services:
     startCommand: uvicorn web_platform.app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: lle-db
-          property: connectionString
+        sync: false
       - key: PYTHONUNBUFFERED
         value: "true"
-    disk:
-      name: web-data-volume
-      mountPath: /opt/render/project/src/web_platform/web_data
-      sizeGB: 5
-
-databases:
-  - name: lle-db
-    databaseName: lle_pairbuilder_db
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        value: lowlight_datasets
+      - key: CLEANUP_AFTER_SAVE
+        value: "true"

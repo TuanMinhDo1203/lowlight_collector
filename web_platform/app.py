@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import shutil
 import uuid
@@ -9,8 +11,9 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
-from .pipeline import PipelineConfig, config_from_form, load_manifest, run_pipeline, save_reviewed_pairs
+from .pipeline import PipelineConfig, config_from_form, load_manifest, run_pipeline
 from .database import init_db, SessionLocal, Job as DBJob, PairCandidate as DBPair, ReviewedPair as DBReviewedPair
+from .storage import cleanup_after_save, cloudinary_enabled, storage_prefix, upload_bytes, upload_file
 
 # Initialize database tables on startup
 init_db()
@@ -1861,6 +1864,96 @@ def get_stats():
     }
 
 
+def write_review_csv(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    output = io.StringIO()
+    fieldnames = sorted({key for row in rows for key in row.keys()})
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
+
+
+def save_reviewed_outputs(job_id: str, reviewed_pairs: list[dict], start_idx: int) -> tuple[int, list[dict], str]:
+    rows: list[dict] = []
+    copied = 0
+    use_cloudinary = cloudinary_enabled()
+
+    if use_cloudinary:
+        prefix = f"{storage_prefix()}/{job_id}"
+        storage_mode = "cloudinary"
+    else:
+        low_dir = DATASET_DIR / "low"
+        high_dir = DATASET_DIR / "high"
+        metadata_dir = DATASET_DIR / "metadata"
+        for folder in [low_dir, high_dir, metadata_dir]:
+            folder.mkdir(parents=True, exist_ok=True)
+        prefix = ""
+        storage_mode = "local"
+
+    for item in reviewed_pairs:
+        if not item.get("accepted", True):
+            continue
+        low_path = Path(item["low_path"])
+        high_path = Path(item["high_path"])
+        if not low_path.exists() or not high_path.exists():
+            continue
+
+        dst_idx = start_idx + copied
+        low_name = f"pair_{dst_idx:06d}_low.png"
+        high_name = f"pair_{dst_idx:06d}_high.png"
+
+        if use_cloudinary:
+            low_key = f"{prefix}/low/{low_name}"
+            high_key = f"{prefix}/high/{high_name}"
+            saved_low = upload_file(low_path, low_key, "image/png")
+            saved_high = upload_file(high_path, high_key, "image/png")
+        else:
+            dst_low = low_dir / low_name
+            dst_high = high_dir / high_name
+            shutil.copy2(low_path, dst_low)
+            shutil.copy2(high_path, dst_high)
+            saved_low = str(dst_low)
+            saved_high = str(dst_high)
+
+        rows.append(
+            {
+                "pair_id": dst_idx,
+                "source_pair_id": item.get("pair_id"),
+                "job_id": job_id,
+                "submitted_by": item.get("submitted_by"),
+                "objective_pairs": item.get("objective_pairs"),
+                "low_path": str(low_path),
+                "high_path": str(high_path),
+                "saved_low": saved_low,
+                "saved_high": saved_high,
+                "score": item.get("score"),
+                "human_decision": item.get("human_decision", "accepted"),
+                "storage": storage_mode,
+            }
+        )
+        copied += 1
+
+    csv_payload = write_review_csv(rows)
+    if csv_payload:
+        if use_cloudinary:
+            upload_bytes(csv_payload.encode("utf-8"), f"{prefix}/metadata/reviewed_pairs.csv", "text/csv; charset=utf-8")
+        else:
+            metadata_path = DATASET_DIR / "metadata" / "reviewed_pairs.csv"
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata_path.write_text(csv_payload, encoding="utf-8")
+
+    return copied, rows, storage_mode
+
+
+def cleanup_job_files(job_id: str) -> None:
+    shutil.rmtree(JOB_DIR / job_id, ignore_errors=True)
+    for path in UPLOAD_DIR.glob(f"{job_id}*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
 @app.post("/api/jobs")
 async def create_job(request: Request, video: UploadFile = File(...)):
     form = await request.form()
@@ -2045,9 +2138,15 @@ async def save_pairs(job_id: str, request: Request):
         item["job_id"] = job_id
         item["submitted_by"] = submitted_by
         item["objective_pairs"] = objective_pairs
-    
-    # Save files as before (maintaining backward compatibility)
-    copied = save_reviewed_pairs(JOB_DIR / job_id, reviewed_pairs, DATASET_DIR)
+
+    db = SessionLocal()
+    try:
+        start_idx = db.query(DBReviewedPair).count()
+    finally:
+        db.close()
+
+    copied, saved_records, storage_mode = save_reviewed_outputs(job_id, reviewed_pairs, start_idx)
+    saved_by_source_pair = {record["source_pair_id"]: record for record in saved_records}
 
     # Save metadata to DB
     db = SessionLocal()
@@ -2057,10 +2156,6 @@ async def save_pairs(job_id: str, request: Request):
             submitted_by = db_job.submitted_by or submitted_by
             objective_pairs = db_job.objective_pairs
 
-        # Get start index for dataset_pair_id (count existing ReviewedPairs in DB)
-        start_idx = db.query(DBReviewedPair).count()
-        copied_db = 0
-        
         for item in reviewed_pairs:
             # Update pair candidate accepted/selected_high_idx in DB
             db_pair = db.query(DBPair).filter(DBPair.job_id == job_id, DBPair.pair_id == item["pair_id"]).first()
@@ -2080,27 +2175,21 @@ async def save_pairs(job_id: str, request: Request):
                 db_pair.inlier_ratio = item.get("inlier_ratio", db_pair.inlier_ratio)
                 db_pair.hog_hits = item.get("hog_hits", db_pair.hog_hits)
             
-            # If accepted, insert into reviewed_pairs table
-            if item.get("accepted", True):
-                # Calculate paths to save in DB (matching the files copied by save_reviewed_pairs)
-                dst_idx = start_idx + copied_db
-                dst_low = str(DATASET_DIR / "low" / f"pair_{dst_idx:06d}_low.png")
-                dst_high = str(DATASET_DIR / "high" / f"pair_{dst_idx:06d}_high.png")
-                
+            saved_record = saved_by_source_pair.get(item.get("pair_id"))
+            if saved_record:
                 db_reviewed = DBReviewedPair(
-                    dataset_pair_id=dst_idx,
+                    dataset_pair_id=saved_record["pair_id"],
                     job_id=job_id,
                     submitted_by=submitted_by,
                     source_pair_id=item.get("pair_id"),
                     low_path=item["low_path"],
                     high_path=item["high_path"],
-                    saved_low=dst_low,
-                    saved_high=dst_high,
+                    saved_low=saved_record["saved_low"],
+                    saved_high=saved_record["saved_high"],
                     score=item.get("score"),
                     human_decision=item.get("human_decision", "accepted")
                 )
                 db.add(db_reviewed)
-                copied_db += 1
                 
         db.commit()
         saved_count = db.query(DBReviewedPair).filter(DBReviewedPair.job_id == job_id).count()
@@ -2121,9 +2210,12 @@ async def save_pairs(job_id: str, request: Request):
         team_saved_count = db.query(DBReviewedPair).count()
     finally:
         db.close()
+    if storage_mode == "cloudinary" and cleanup_after_save():
+        cleanup_job_files(job_id)
     return {
         "copied": copied,
-        "dataset_dir": str(DATASET_DIR),
+        "dataset_dir": "Cloudinary" if storage_mode == "cloudinary" else str(DATASET_DIR),
+        "storage": storage_mode,
         "submitted_by": submitted_by,
         "objective_pairs": objective_pairs,
         "saved_count": saved_count,
