@@ -6,15 +6,44 @@ from functools import lru_cache
 from pathlib import Path
 
 
+def first_env(*keys: str) -> str | None:
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
 def cloudinary_enabled() -> bool:
     if os.environ.get("CLOUDINARY_URL"):
         return True
-    required = [
-        "CLOUDINARY_CLOUD_NAME",
-        "CLOUDINARY_API_KEY",
-        "CLOUDINARY_API_SECRET",
-    ]
-    return all(os.environ.get(key) for key in required)
+    return not missing_cloudinary_vars()
+
+
+def missing_cloudinary_vars() -> list[str]:
+    if os.environ.get("CLOUDINARY_URL"):
+        return []
+    missing = []
+    if not first_env("CLOUDINARY_CLOUD_NAME", "CLOUD_NAME", "CLOUDINARY_NAME"):
+        missing.append("CLOUDINARY_CLOUD_NAME")
+    if not first_env("CLOUDINARY_API_KEY", "CLOUDINARY_KEY"):
+        missing.append("CLOUDINARY_API_KEY")
+    if not first_env("CLOUDINARY_API_SECRET", "CLOUDINARY_SECRET", "CLOUDINARY_API_SECRET_KEY"):
+        missing.append("CLOUDINARY_API_SECRET")
+    return missing
+
+
+def cloudinary_env_diagnostics() -> dict:
+    api_key = first_env("CLOUDINARY_API_KEY", "CLOUDINARY_KEY") or ""
+    return {
+        "cloudinary_url_present": bool(os.environ.get("CLOUDINARY_URL")),
+        "cloud_name_present": bool(first_env("CLOUDINARY_CLOUD_NAME", "CLOUD_NAME", "CLOUDINARY_NAME")),
+        "cloud_name": first_env("CLOUDINARY_CLOUD_NAME", "CLOUD_NAME", "CLOUDINARY_NAME"),
+        "api_key_present": bool(api_key),
+        "api_key_last4": api_key[-4:] if api_key else None,
+        "api_secret_present": bool(first_env("CLOUDINARY_API_SECRET", "CLOUDINARY_SECRET", "CLOUDINARY_API_SECRET_KEY")),
+        "folder": storage_prefix(),
+    }
 
 
 def storage_prefix() -> str:
@@ -39,9 +68,9 @@ def configure_cloudinary():
         cloudinary.config(secure=True)
     else:
         cloudinary.config(
-            cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
-            api_key=os.environ["CLOUDINARY_API_KEY"],
-            api_secret=os.environ["CLOUDINARY_API_SECRET"],
+            cloud_name=first_env("CLOUDINARY_CLOUD_NAME", "CLOUD_NAME", "CLOUDINARY_NAME"),
+            api_key=first_env("CLOUDINARY_API_KEY", "CLOUDINARY_KEY"),
+            api_secret=first_env("CLOUDINARY_API_SECRET", "CLOUDINARY_SECRET", "CLOUDINARY_API_SECRET_KEY"),
             secure=True,
         )
     return True
@@ -84,7 +113,14 @@ def upload_bytes(payload: bytes, key: str, content_type: str = "application/octe
 
 def cloudinary_health() -> dict:
     if not configure_cloudinary():
-        return {"configured": False, "ok": False, "error": "Cloudinary env vars are missing."}
+        missing = missing_cloudinary_vars()
+        return {
+            "configured": False,
+            "ok": False,
+            "error": "Cloudinary env vars are missing.",
+            "missing": missing,
+            "env": cloudinary_env_diagnostics(),
+        }
 
     try:
         import cloudinary.api
@@ -94,6 +130,7 @@ def cloudinary_health() -> dict:
             "configured": True,
             "ok": result.get("status") == "ok",
             "status": result.get("status"),
+            "env": cloudinary_env_diagnostics(),
         }
     except Exception as exc:
-        return {"configured": True, "ok": False, "error": str(exc)}
+        return {"configured": True, "ok": False, "error": str(exc), "env": cloudinary_env_diagnostics()}
