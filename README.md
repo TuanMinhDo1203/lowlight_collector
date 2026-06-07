@@ -75,6 +75,31 @@ Các bước:
 6. Điền `DATABASE_URL` từ Supabase và credentials Cloudinary trong Environment.
 7. Deploy xong mở URL Render cấp.
 
+## Kiểm Tra Sau Deploy
+
+Mở:
+
+```text
+https://<render-service-url>/api/health
+```
+
+Kết quả tốt sẽ có:
+
+```json
+{
+  "app": "ok",
+  "database": {"ok": true},
+  "cloudinary": {"configured": true, "ok": true},
+  "team_objective_pairs": 500
+}
+```
+
+Kiểm tra progress dataset:
+
+```text
+https://<render-service-url>/api/stats
+```
+
 ## File Chính
 
 ```text

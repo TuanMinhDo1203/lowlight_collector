@@ -80,3 +80,20 @@ def upload_bytes(payload: bytes, key: str, content_type: str = "application/octe
         handle.write(payload)
         handle.flush()
         return upload_file(Path(handle.name), key, content_type)
+
+
+def cloudinary_health() -> dict:
+    if not configure_cloudinary():
+        return {"configured": False, "ok": False, "error": "Cloudinary env vars are missing."}
+
+    try:
+        import cloudinary.api
+
+        result = cloudinary.api.ping()
+        return {
+            "configured": True,
+            "ok": result.get("status") == "ok",
+            "status": result.get("status"),
+        }
+    except Exception as exc:
+        return {"configured": True, "ok": False, "error": str(exc)}

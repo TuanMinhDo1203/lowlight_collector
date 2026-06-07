@@ -10,10 +10,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
+from sqlalchemy import text
 
 from .pipeline import PipelineConfig, config_from_form, load_manifest, run_pipeline
 from .database import init_db, SessionLocal, Job as DBJob, PairCandidate as DBPair, ReviewedPair as DBReviewedPair
-from .storage import cleanup_after_save, cloudinary_enabled, storage_prefix, upload_bytes, upload_file
+from .storage import cleanup_after_save, cloudinary_enabled, cloudinary_health, storage_prefix, upload_bytes, upload_file
 
 # Initialize database tables on startup
 init_db()
@@ -1861,6 +1862,30 @@ def get_stats():
         "objective_pairs": TEAM_OBJECTIVE_PAIRS,
         "saved_count": saved_count,
         "remaining_pairs": max(TEAM_OBJECTIVE_PAIRS - saved_count, 0),
+    }
+
+
+@app.get("/api/health")
+def health_check():
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        db_ok = True
+        db_error = None
+    except Exception as exc:
+        db_ok = False
+        db_error = str(exc)
+    finally:
+        db.close()
+
+    return {
+        "app": "ok",
+        "database": {
+            "ok": db_ok,
+            "error": db_error,
+        },
+        "cloudinary": cloudinary_health(),
+        "team_objective_pairs": TEAM_OBJECTIVE_PAIRS,
     }
 
 
