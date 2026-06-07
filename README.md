@@ -2,6 +2,12 @@
 
 Web platform để upload video, tự tách các cặp ảnh LOW/HIGH, cho user review lại LOW/HIGH thủ công, rồi lưu dataset đã duyệt.
 
+App có tracking cho từng video:
+
+- **Người nộp**: lưu tên member upload video.
+- **Mục tiêu số cặp ảnh**: hiển thị đã lưu bao nhiêu cặp và còn thiếu bao nhiêu cặp.
+- Metadata được lưu vào Postgres và CSV trong `web_platform/web_data/selected_dataset/metadata`.
+
 ## Chạy Local
 
 ```bash

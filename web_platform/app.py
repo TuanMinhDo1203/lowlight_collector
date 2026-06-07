@@ -27,6 +27,7 @@ for folder in [UPLOAD_DIR, JOB_DIR, DATASET_DIR]:
 app = FastAPI(title="Low Light Pair Builder")
 executor = ThreadPoolExecutor(max_workers=1)
 jobs: dict[str, dict] = {}
+TEAM_OBJECTIVE_PAIRS = 500
 
 
 INDEX_HTML = """<!doctype html>
@@ -490,6 +491,151 @@ INDEX_HTML = """<!doctype html>
       font-family: monospace;
     }
 
+    .job-fields {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      margin: 14px 0;
+    }
+
+    .job-field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .job-field label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-secondary);
+    }
+
+    .job-field input {
+      width: 100%;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      color: var(--text-primary);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      outline: none;
+    }
+
+    .job-field input:focus {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 3px rgba(6, 182, 212, 0.12);
+    }
+
+    .objective-progress {
+      margin-top: 12px;
+      display: grid;
+      grid-template-columns: minmax(220px, 1.35fr) repeat(3, minmax(120px, 1fr));
+      gap: 10px;
+    }
+
+    .objective-chart-card {
+      border-radius: 10px;
+      padding: 12px;
+      border: 1px solid rgba(6, 182, 212, 0.25);
+      background: rgba(6, 182, 212, 0.08);
+      display: grid;
+      grid-template-columns: 92px 1fr;
+      gap: 12px;
+      align-items: center;
+      min-height: 112px;
+    }
+
+    .pie-chart {
+      width: 86px;
+      height: 86px;
+      border-radius: 50%;
+      background: conic-gradient(var(--accent-cyan) var(--pie-deg, 0deg), rgba(255, 255, 255, 0.08) 0deg);
+      display: grid;
+      place-items: center;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08), 0 0 20px rgba(6, 182, 212, 0.12);
+    }
+
+    .pie-chart::after {
+      content: attr(data-percent);
+      width: 58px;
+      height: 58px;
+      border-radius: 50%;
+      background: rgba(10, 15, 30, 0.92);
+      display: grid;
+      place-items: center;
+      color: var(--text-primary);
+      font-size: 15px;
+      font-weight: 800;
+    }
+
+    .objective-chart-copy {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .objective-pill {
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid rgba(6, 182, 212, 0.2);
+      color: var(--text-primary);
+      background: rgba(6, 182, 212, 0.08);
+      display: grid;
+      gap: 4px;
+      min-height: 64px;
+    }
+
+    .objective-label {
+      font-size: 10.5px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 800;
+    }
+
+    .objective-value {
+      color: var(--accent-cyan);
+      font-size: 16px;
+      font-weight: 800;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+    }
+
+    .objective-note {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+
+    .objective-pill.done {
+      border-color: rgba(16, 185, 129, 0.35);
+      background: rgba(16, 185, 129, 0.1);
+    }
+
+    .objective-pill.done .objective-value {
+      color: #10b981;
+    }
+
+    @media (max-width: 900px) {
+      .objective-progress {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .objective-chart-card {
+        grid-column: 1 / -1;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .objective-progress {
+        grid-template-columns: 1fr;
+      }
+
+      .objective-chart-card {
+        grid-template-columns: 1fr;
+        justify-items: center;
+        text-align: center;
+      }
+    }
+
     .section-title-flex {
       display: flex;
       justify-content: space-between;
@@ -950,6 +1096,16 @@ INDEX_HTML = """<!doctype html>
               <input id="videoInput" name="video" type="file" accept="video/*" required>
               <div class="file-info" id="fileInfo">Chưa chọn video nào</div>
             </div>
+            <div class="job-fields">
+              <div class="job-field">
+                <label for="submittedByInput">Người nộp</label>
+                <input id="submittedByInput" name="submitted_by" type="text" maxlength="120" placeholder="VD: Nguyễn Văn A" required>
+              </div>
+              <div class="job-field">
+                <label for="objectivePairsInput">Mục tiêu team</label>
+                <input id="objectivePairsInput" name="objective_pairs" type="number" min="1" step="1" value="500" readonly>
+              </div>
+            </div>
             <button id="uploadBtn" type="submit" class="btn btn-submit">Xử lý video</button>
           </div>
 
@@ -1080,6 +1236,31 @@ INDEX_HTML = """<!doctype html>
       <section class="workspace">
         <div class="card status-card">
           <div class="status-indicator" id="status">Vui lòng tải video lên để bắt đầu tạo cặp ảnh.</div>
+          <div class="objective-progress" id="objectiveProgress">
+            <div class="objective-chart-card">
+              <div class="pie-chart" style="--pie-deg: 0deg;" data-percent="0%"></div>
+              <div class="objective-chart-copy">
+                <span class="objective-label">Mục tiêu team</span>
+                <span class="objective-value">0/500 cặp</span>
+                <span class="objective-note">Còn thiếu 500 cặp ảnh</span>
+              </div>
+            </div>
+            <div class="objective-pill">
+              <span class="objective-label">Người nộp</span>
+              <span class="objective-value">Chưa nhập</span>
+              <span class="objective-note">Nhập ở form upload</span>
+            </div>
+            <div class="objective-pill">
+              <span class="objective-label">Auto detect</span>
+              <span class="objective-value">0 cặp</span>
+              <span class="objective-note">Sau xử lý sẽ cập nhật</span>
+            </div>
+            <div class="objective-pill">
+              <span class="objective-label">Đã lưu</span>
+              <span class="objective-value">0 cặp</span>
+              <span class="objective-note">Sau khi bấm lưu</span>
+            </div>
+          </div>
           <div class="summary-grid" id="summary"></div>
         </div>
 
@@ -1105,6 +1286,8 @@ INDEX_HTML = """<!doctype html>
     let currentPairs = [];
     let lowOptions = [];
     let highOptions = [];
+    let currentJobMeta = { submitted_by: "", objective_pairs: null, saved_count: 0 };
+    let teamStats = { saved_count: 0, objective_pairs: 500, remaining_pairs: 500 };
 
     const uploadForm = document.getElementById("uploadForm");
     const uploadBtn = document.getElementById("uploadBtn");
@@ -1114,10 +1297,13 @@ INDEX_HTML = """<!doctype html>
     const pairsEl = document.getElementById("pairs");
     const summaryEl = document.getElementById("summary");
     const pairsCountEl = document.getElementById("pairsCount");
+    const objectiveProgressEl = document.getElementById("objectiveProgress");
 
     // File input change event for better UX
     const videoInput = document.getElementById("videoInput");
     const fileInfo = document.getElementById("fileInfo");
+    const submittedByInput = document.getElementById("submittedByInput");
+    const objectivePairsInput = document.getElementById("objectivePairsInput");
     if (videoInput && fileInfo) {
       videoInput.addEventListener("change", (e) => {
         const file = e.target.files[0];
@@ -1129,6 +1315,19 @@ INDEX_HTML = """<!doctype html>
           fileInfo.style.color = "";
         }
       });
+    }
+
+    function syncJobMetaFromInputs() {
+      currentJobMeta.submitted_by = submittedByInput ? submittedByInput.value.trim() : "";
+      currentJobMeta.objective_pairs = objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : null;
+      renderObjectiveProgress();
+    }
+
+    if (submittedByInput) {
+      submittedByInput.addEventListener("input", syncJobMetaFromInputs);
+    }
+    if (objectivePairsInput) {
+      objectivePairsInput.addEventListener("input", syncJobMetaFromInputs);
     }
 
     // Default params reset handler
@@ -1162,6 +1361,11 @@ INDEX_HTML = """<!doctype html>
       currentPairs = [];
       lowOptions = [];
       highOptions = [];
+      currentJobMeta = {
+        submitted_by: submittedByInput ? submittedByInput.value.trim() : "",
+        objective_pairs: objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : null,
+        saved_count: 0
+      };
       pairsEl.innerHTML = `
         <div class="empty-state">
           <div class="spinner" style="width: 32px; height: 32px; margin: 0 auto 16px auto;"></div>
@@ -1170,6 +1374,7 @@ INDEX_HTML = """<!doctype html>
         </div>
       `;
       summaryEl.innerHTML = "";
+      renderObjectiveProgress();
       saveBtn.disabled = true;
       addPairBtn.disabled = true;
       uploadBtn.disabled = true;
@@ -1211,11 +1416,17 @@ INDEX_HTML = """<!doctype html>
           currentPairs = job.pairs || [];
           lowOptions = job.low_options || [];
           highOptions = job.high_options || [];
+          currentJobMeta = {
+            submitted_by: job.submitted_by || currentJobMeta.submitted_by || "",
+            objective_pairs: job.objective_pairs || currentJobMeta.objective_pairs || null,
+            saved_count: job.saved_count || 0
+          };
           renderSummary(job.summary || {});
+          renderObjectiveProgress();
           statusEl.innerHTML = `
             <span class="success-message">
               <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
-              Hoàn thành! Đã tự động phát hiện ${currentPairs.length} cặp ảnh LOW-HIGH tối ưu.
+              Hoàn thành! Đã tự động phát hiện ${currentPairs.length} cặp ảnh LOW-HIGH tối ưu${currentJobMeta.submitted_by ? ` cho ${currentJobMeta.submitted_by}` : ""}.
             </span>
           `;
           if (pairsCountEl) pairsCountEl.textContent = `${currentPairs.length} cặp`;
@@ -1251,6 +1462,65 @@ INDEX_HTML = """<!doctype html>
     function renderSummary(summary) {
       summaryEl.innerHTML = Object.entries(summary).map(([key, value]) => `<span>${key}: ${value}</span>`).join("");
     }
+
+    function renderObjectiveProgress(savedOverride = null) {
+      if (!objectiveProgressEl) return;
+      const submitter = currentJobMeta.submitted_by || "Chưa nhập";
+      const teamTarget = Number(teamStats.objective_pairs || 500);
+      const teamSaved = Number(teamStats.saved_count || 0);
+      const teamRemaining = Math.max(teamTarget - teamSaved, 0);
+      const percent = teamTarget > 0 ? Math.min(Math.round((teamSaved / teamTarget) * 100), 100) : 0;
+      const pieDeg = Math.min((teamSaved / Math.max(teamTarget, 1)) * 360, 360).toFixed(1);
+      const saved = savedOverride === null ? Number(currentJobMeta.saved_count || 0) : Number(savedOverride || 0);
+      const detected = currentPairs.length || 0;
+
+      const doneClass = teamTarget > 0 && teamSaved >= teamTarget ? "done" : "";
+      objectiveProgressEl.innerHTML = `
+        <div class="objective-chart-card ${doneClass}">
+          <div class="pie-chart" style="--pie-deg: ${pieDeg}deg;" data-percent="${percent}%"></div>
+          <div class="objective-chart-copy">
+            <span class="objective-label">Mục tiêu team</span>
+            <span class="objective-value">${teamSaved}/${teamTarget} cặp</span>
+            <span class="objective-note">${teamRemaining === 0 ? "Đã đạt mục tiêu 500 cặp" : `Còn thiếu ${teamRemaining} cặp ảnh`}</span>
+          </div>
+        </div>
+        <div class="objective-pill">
+          <span class="objective-label">Người nộp</span>
+          <span class="objective-value">${submitter}</span>
+          <span class="objective-note">${currentJobId ? `Job ${currentJobId}` : "Nhập trước khi xử lý"}</span>
+        </div>
+        <div class="objective-pill">
+          <span class="objective-label">Auto detect</span>
+          <span class="objective-value">${detected} cặp</span>
+          <span class="objective-note">Cặp pipeline đề xuất</span>
+        </div>
+        <div class="objective-pill ${doneClass}">
+          <span class="objective-label">Đã lưu</span>
+          <span class="objective-value">${saved} cặp</span>
+          <span class="objective-note">Cặp của job hiện tại</span>
+        </div>
+      `;
+    }
+
+    renderObjectiveProgress();
+
+    async function fetchTeamStats() {
+      try {
+        const response = await fetch("/api/stats");
+        if (!response.ok) return;
+        const stats = await response.json();
+        teamStats = {
+          saved_count: Number(stats.saved_count || 0),
+          objective_pairs: Number(stats.objective_pairs || 500),
+          remaining_pairs: Number(stats.remaining_pairs || 0)
+        };
+        renderObjectiveProgress();
+      } catch (err) {
+        // Keep the local default if stats cannot be fetched.
+      }
+    }
+
+    fetchTeamStats();
 
     function optionLabel(alt) {
       const hog = Number(alt.hog_hits || 0);
@@ -1450,10 +1720,22 @@ INDEX_HTML = """<!doctype html>
           body: JSON.stringify({ pairs: reviewed })
         });
         const payload = await response.json();
+        currentJobMeta.saved_count = payload.saved_count || payload.copied || 0;
+        currentJobMeta.objective_pairs = payload.objective_pairs || currentJobMeta.objective_pairs;
+        currentJobMeta.submitted_by = payload.submitted_by || currentJobMeta.submitted_by;
+        renderObjectiveProgress(currentJobMeta.saved_count);
+        if (payload.team_objective_pairs) {
+          teamStats = {
+            saved_count: Number(payload.team_saved_count || 0),
+            objective_pairs: Number(payload.team_objective_pairs || 500),
+            remaining_pairs: Number(payload.team_remaining_pairs || 0)
+          };
+        }
+        const remainingText = payload.team_objective_pairs ? ` Tiến độ team: ${payload.team_saved_count}/${payload.team_objective_pairs}, còn thiếu ${payload.team_remaining_pairs} cặp.` : "";
         statusEl.innerHTML = `
           <span class="success-message">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
-            Đã lưu thành công ${payload.copied} cặp đã duyệt vào thư mục kết quả.
+            Đã lưu thành công ${payload.copied} cặp đã duyệt vào thư mục kết quả.${remainingText}
           </span>
         `;
       } catch (err) {
@@ -1495,6 +1777,9 @@ def process_job(job_id: str, video_path: Path, config: PipelineConfig) -> None:
                 "high_options": manifest["high_options"],
                 "summary": manifest["summary"],
                 "config": manifest["config"],
+                "submitted_by": jobs[job_id].get("submitted_by"),
+                "objective_pairs": jobs[job_id].get("objective_pairs"),
+                "saved_count": jobs[job_id].get("saved_count", 0),
             }
         )
         
@@ -1562,10 +1847,32 @@ def index():
     return INDEX_HTML
 
 
+@app.get("/api/stats")
+def get_stats():
+    db = SessionLocal()
+    try:
+        saved_count = db.query(DBReviewedPair).count()
+    finally:
+        db.close()
+    return {
+        "objective_pairs": TEAM_OBJECTIVE_PAIRS,
+        "saved_count": saved_count,
+        "remaining_pairs": max(TEAM_OBJECTIVE_PAIRS - saved_count, 0),
+    }
+
+
 @app.post("/api/jobs")
 async def create_job(request: Request, video: UploadFile = File(...)):
     form = await request.form()
     config = config_from_form(dict(form))
+    submitted_by = str(form.get("submitted_by") or "").strip() or "Không rõ"
+    objective_raw = form.get("objective_pairs")
+    try:
+        objective_pairs = int(objective_raw) if objective_raw not in ("", None) else None
+    except (TypeError, ValueError):
+        objective_pairs = None
+    if objective_pairs is not None and objective_pairs <= 0:
+        objective_pairs = None
     suffix = Path(video.filename or "upload.mp4").suffix or ".mp4"
     job_id = uuid.uuid4().hex[:12]
     video_path = UPLOAD_DIR / f"{job_id}{suffix}"
@@ -1574,7 +1881,15 @@ async def create_job(request: Request, video: UploadFile = File(...)):
         shutil.copyfileobj(video.file, handle)
 
     # Memory state
-    jobs[job_id] = {"status": "queued", "message": "Đang chờ xử lý", "pairs": [], "summary": {}}
+    jobs[job_id] = {
+        "status": "queued",
+        "message": "Đang chờ xử lý",
+        "pairs": [],
+        "summary": {},
+        "submitted_by": submitted_by,
+        "objective_pairs": objective_pairs,
+        "saved_count": 0,
+    }
     
     # Save queued job state to Database
     db = SessionLocal()
@@ -1583,7 +1898,9 @@ async def create_job(request: Request, video: UploadFile = File(...)):
             job_id=job_id,
             status="queued",
             message="Đang chờ xử lý",
-            video_name=video.filename
+            video_name=video.filename,
+            submitted_by=submitted_by,
+            objective_pairs=objective_pairs,
         )
         db.add(db_job)
         db.commit()
@@ -1613,7 +1930,15 @@ def get_job(job_id: str):
                 return {"status": "failed", "error": db_job.error or "Lỗi không xác định"}
             # If job is still running/queued (fallback/recovery)
             if db_job.status in ("queued", "running"):
-                return {"status": db_job.status, "message": db_job.message, "pairs": [], "summary": {}}
+                return {
+                    "status": db_job.status,
+                    "message": db_job.message,
+                    "pairs": [],
+                    "summary": {},
+                    "submitted_by": db_job.submitted_by,
+                    "objective_pairs": db_job.objective_pairs,
+                    "saved_count": db.query(DBReviewedPair).filter(DBReviewedPair.job_id == job_id).count(),
+                }
             
             # If job is done, rebuild the response from the DB tables
             db_pairs = db.query(DBPair).filter(DBPair.job_id == job_id).order_by(DBPair.pair_id).all()
@@ -1645,6 +1970,9 @@ def get_job(job_id: str):
                 "high_options": json.loads(db_job.high_options_json or "[]"),
                 "summary": json.loads(db_job.summary_json or "{}"),
                 "config": json.loads(db_job.config_json or "{}"),
+                "submitted_by": db_job.submitted_by,
+                "objective_pairs": db_job.objective_pairs,
+                "saved_count": db.query(DBReviewedPair).filter(DBReviewedPair.job_id == job_id).count(),
             }
     except Exception as e:
         print(f"Error querying job from DB: {e}")
@@ -1663,6 +1991,9 @@ def get_job(job_id: str):
         "high_options": manifest["high_options"],
         "summary": manifest["summary"],
         "config": manifest["config"],
+        "submitted_by": jobs.get(job_id, {}).get("submitted_by"),
+        "objective_pairs": jobs.get(job_id, {}).get("objective_pairs"),
+        "saved_count": jobs.get(job_id, {}).get("saved_count", 0),
     }
 
 
@@ -1696,6 +2027,24 @@ async def save_pairs(job_id: str, request: Request):
 
     payload = await request.json()
     reviewed_pairs = payload.get("pairs", [])
+    submitted_by = jobs.get(job_id, {}).get("submitted_by") or "Không rõ"
+    objective_pairs = jobs.get(job_id, {}).get("objective_pairs")
+
+    db = SessionLocal()
+    try:
+        db_job = db.query(DBJob).filter(DBJob.job_id == job_id).first()
+        if db_job:
+            submitted_by = db_job.submitted_by or submitted_by
+            objective_pairs = db_job.objective_pairs
+    except Exception as e:
+        print(f"Error reading job metadata before saving files: {e}")
+    finally:
+        db.close()
+
+    for item in reviewed_pairs:
+        item["job_id"] = job_id
+        item["submitted_by"] = submitted_by
+        item["objective_pairs"] = objective_pairs
     
     # Save files as before (maintaining backward compatibility)
     copied = save_reviewed_pairs(JOB_DIR / job_id, reviewed_pairs, DATASET_DIR)
@@ -1703,6 +2052,11 @@ async def save_pairs(job_id: str, request: Request):
     # Save metadata to DB
     db = SessionLocal()
     try:
+        db_job = db.query(DBJob).filter(DBJob.job_id == job_id).first()
+        if db_job:
+            submitted_by = db_job.submitted_by or submitted_by
+            objective_pairs = db_job.objective_pairs
+
         # Get start index for dataset_pair_id (count existing ReviewedPairs in DB)
         start_idx = db.query(DBReviewedPair).count()
         copied_db = 0
@@ -1736,6 +2090,7 @@ async def save_pairs(job_id: str, request: Request):
                 db_reviewed = DBReviewedPair(
                     dataset_pair_id=dst_idx,
                     job_id=job_id,
+                    submitted_by=submitted_by,
                     source_pair_id=item.get("pair_id"),
                     low_path=item["low_path"],
                     high_path=item["high_path"],
@@ -1748,10 +2103,32 @@ async def save_pairs(job_id: str, request: Request):
                 copied_db += 1
                 
         db.commit()
+        saved_count = db.query(DBReviewedPair).filter(DBReviewedPair.job_id == job_id).count()
     except Exception as db_exc:
         print(f"Error saving reviewed pairs to DB: {db_exc}")
         db.rollback()
+        saved_count = copied
     finally:
         db.close()
 
-    return {"copied": copied, "dataset_dir": str(DATASET_DIR)}
+    if job_id in jobs:
+        jobs[job_id]["saved_count"] = saved_count
+        jobs[job_id]["submitted_by"] = submitted_by
+        jobs[job_id]["objective_pairs"] = objective_pairs
+    remaining_pairs = max(int(objective_pairs or 0) - int(saved_count or 0), 0) if objective_pairs else None
+    db = SessionLocal()
+    try:
+        team_saved_count = db.query(DBReviewedPair).count()
+    finally:
+        db.close()
+    return {
+        "copied": copied,
+        "dataset_dir": str(DATASET_DIR),
+        "submitted_by": submitted_by,
+        "objective_pairs": objective_pairs,
+        "saved_count": saved_count,
+        "remaining_pairs": remaining_pairs,
+        "team_objective_pairs": TEAM_OBJECTIVE_PAIRS,
+        "team_saved_count": team_saved_count,
+        "team_remaining_pairs": max(TEAM_OBJECTIVE_PAIRS - team_saved_count, 0),
+    }

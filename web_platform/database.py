@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, Text, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy import inspect, text
 
 # Resolve DATA_DIR locally to avoid circular imports with app.py
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,6 +34,8 @@ class Job(Base):
     message = Column(String(255), nullable=True)
     error = Column(Text, nullable=True)
     video_name = Column(String(255), nullable=True)
+    submitted_by = Column(String(120), nullable=True)
+    objective_pairs = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     config_json = Column(Text, nullable=True)
     low_options_json = Column(Text, nullable=True)
@@ -71,6 +74,7 @@ class ReviewedPair(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     dataset_pair_id = Column(Integer, index=True) # Unique ID in the final dataset
     job_id = Column(String(32), index=True)
+    submitted_by = Column(String(120), nullable=True)
     source_pair_id = Column(Integer)
     low_path = Column(String(512))
     high_path = Column(String(512))
@@ -82,3 +86,28 @@ class ReviewedPair(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    ensure_schema_columns()
+
+
+def ensure_schema_columns():
+    inspector = inspect(engine)
+    existing = {
+        table: {column["name"] for column in inspector.get_columns(table)}
+        for table in inspector.get_table_names()
+    }
+    additions = {
+        "jobs": {
+            "submitted_by": "VARCHAR(120)",
+            "objective_pairs": "INTEGER",
+        },
+        "reviewed_pairs": {
+            "submitted_by": "VARCHAR(120)",
+        },
+    }
+    with engine.begin() as conn:
+        for table, columns in additions.items():
+            if table not in existing:
+                continue
+            for column, column_type in columns.items():
+                if column not in existing[table]:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))

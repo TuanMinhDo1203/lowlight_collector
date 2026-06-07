@@ -559,6 +559,9 @@ def save_reviewed_pairs(job_dir: Path, reviewed_pairs: list[dict], dataset_dir: 
             {
                 "pair_id": dst_idx,
                 "source_pair_id": item.get("pair_id"),
+                "job_id": item.get("job_id"),
+                "submitted_by": item.get("submitted_by"),
+                "objective_pairs": item.get("objective_pairs"),
                 "low_path": str(low_path),
                 "high_path": str(high_path),
                 "saved_low": str(dst_low),
