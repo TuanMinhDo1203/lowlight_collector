@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: lle-pairbuilder
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn web_platform.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: lle-db
+          property: connectionString
+      - key: PYTHONUNBUFFERED
+        value: "true"
+    disk:
+      name: web-data-volume
+      mountPath: /opt/render/project/src/web_platform/web_data
+      sizeGB: 5
+
+databases:
+  - name: lle-db
+    databaseName: lle_pairbuilder_db
