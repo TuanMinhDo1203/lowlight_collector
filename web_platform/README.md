@@ -43,7 +43,6 @@ Nếu chạy local hoặc chưa cấu hình Cloudinary, các cặp đã chọn �
 ```text
 web_data/selected_dataset/low
 web_data/selected_dataset/high
-web_data/selected_dataset/metadata/reviewed_pairs.csv
 ```
 
 Khi deploy Render free với Cloudinary, ảnh LOW/HIGH final được upload lên Cloudinary theo folder:
@@ -51,7 +50,6 @@ Khi deploy Render free với Cloudinary, ảnh LOW/HIGH final được upload l�
 ```text
 lowlight_datasets/<job_id>/low
 lowlight_datasets/<job_id>/high
-lowlight_datasets/<job_id>/metadata/reviewed_pairs.csv
 ```
 
 Supabase Postgres lưu metadata gồm `job_id`, `submitted_by`, đường dẫn ảnh gốc tạm thời và URL Cloudinary đã lưu.

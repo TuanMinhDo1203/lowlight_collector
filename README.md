@@ -8,7 +8,7 @@ App có tracking cho team và từng video:
 - **Mục tiêu số cặp ảnh**: hiển thị đã lưu bao nhiêu cặp và còn thiếu bao nhiêu cặp.
 - Mục tiêu team mặc định: **500 cặp ảnh**.
 - Ảnh final có thể lưu lên Cloudinary nếu cấu hình biến môi trường Cloudinary.
-- Metadata được lưu vào Supabase Postgres hoặc Postgres tương thích; CSV metadata cũng được upload lên Cloudinary theo từng job.
+- Metadata được lưu vào Supabase Postgres hoặc Postgres tương thích.
 
 ## Chạy Local
 
@@ -35,7 +35,7 @@ Repo đã có `render.yaml`, gồm:
 - Web service FastAPI
 - Supabase Postgres để lưu metadata job/pair
 - Cloudinary để lưu ảnh LOW/HIGH final lâu dài
-- Python pinned ở `3.11.9` qua `PYTHON_VERSION` và `.python-version`
+- Python pinned ở `3.11.15` qua `PYTHON_VERSION` và `.python-version`
 
 Render free không hỗ trợ persistent disk, nên app dùng `web_platform/web_data` làm nơi xử lý tạm. Sau khi lưu cặp đã duyệt, ảnh final được upload lên Cloudinary và file tạm có thể được cleanup.
 

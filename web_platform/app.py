@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import csv
-import io
 import json
 import shutil
 import uuid
@@ -14,10 +12,15 @@ from sqlalchemy import text
 
 from .pipeline import PipelineConfig, config_from_form, load_manifest, run_pipeline
 from .database import init_db, SessionLocal, Job as DBJob, PairCandidate as DBPair, ReviewedPair as DBReviewedPair
-from .storage import cleanup_after_save, cloudinary_enabled, cloudinary_health, storage_prefix, upload_bytes, upload_file
+from .storage import cleanup_after_save, cloudinary_enabled, cloudinary_health, storage_prefix, upload_file
 
 # Initialize database tables on startup
-init_db()
+DB_INIT_ERROR: str | None = None
+try:
+    init_db()
+except Exception as exc:
+    DB_INIT_ERROR = str(exc)
+    print(f"Database initialization failed: {exc}")
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "web_data"
@@ -1883,21 +1886,11 @@ def health_check():
         "database": {
             "ok": db_ok,
             "error": db_error,
+            "init_error": DB_INIT_ERROR,
         },
         "cloudinary": cloudinary_health(),
         "team_objective_pairs": TEAM_OBJECTIVE_PAIRS,
     }
-
-
-def write_review_csv(rows: list[dict]) -> str:
-    if not rows:
-        return ""
-    output = io.StringIO()
-    fieldnames = sorted({key for row in rows for key in row.keys()})
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
-    writer.writeheader()
-    writer.writerows(rows)
-    return output.getvalue()
 
 
 def save_reviewed_outputs(job_id: str, reviewed_pairs: list[dict], start_idx: int) -> tuple[int, list[dict], str]:
@@ -1911,8 +1904,7 @@ def save_reviewed_outputs(job_id: str, reviewed_pairs: list[dict], start_idx: in
     else:
         low_dir = DATASET_DIR / "low"
         high_dir = DATASET_DIR / "high"
-        metadata_dir = DATASET_DIR / "metadata"
-        for folder in [low_dir, high_dir, metadata_dir]:
+        for folder in [low_dir, high_dir]:
             folder.mkdir(parents=True, exist_ok=True)
         prefix = ""
         storage_mode = "local"
@@ -1959,15 +1951,6 @@ def save_reviewed_outputs(job_id: str, reviewed_pairs: list[dict], start_idx: in
             }
         )
         copied += 1
-
-    csv_payload = write_review_csv(rows)
-    if csv_payload:
-        if use_cloudinary:
-            upload_bytes(csv_payload.encode("utf-8"), f"{prefix}/metadata/reviewed_pairs.csv", "text/csv; charset=utf-8")
-        else:
-            metadata_path = DATASET_DIR / "metadata" / "reviewed_pairs.csv"
-            metadata_path.parent.mkdir(parents=True, exist_ok=True)
-            metadata_path.write_text(csv_payload, encoding="utf-8")
 
     return copied, rows, storage_mode
 
