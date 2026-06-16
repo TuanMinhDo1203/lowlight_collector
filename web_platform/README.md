@@ -4,12 +4,12 @@ Web app local để tạo dataset cặp ảnh thiếu sáng/đủ sáng từ vid
 
 Luồng sử dụng:
 
-1. Tải video lên.
+1. Tải video lên để pipeline tự tìm cặp, hoặc upload nhanh một batch ảnh LOW/HIGH có sẵn.
 2. Chỉnh tham số pipeline nếu cần.
 3. Review các cặp LOW/HIGH được chọn tự động.
 4. Nếu cặp chưa đúng, đổi **Frame LOW** hoặc **Frame HIGH** bằng dropdown.
 5. Dùng **Thêm cặp thủ công** nếu pipeline bỏ sót một cặp tốt.
-6. Loại cặp xấu hoặc lưu các cặp đã duyệt.
+6. Loại cặp xấu hoặc lưu các cặp đã duyệt. Với upload nhanh batch ảnh, app sẽ hiển thị preview trước, cho đổi LOW/HIGH bằng dropdown; chỉ khi bấm **Lưu cặp đã duyệt** thì ảnh mới được lưu lên Cloudinary/Supabase. Các cặp trong một lần upload batch dùng chung `job_id`/source group để sau này split dataset tránh leakage.
 
 Hướng dẫn tham số chi tiết nằm ở `WEB_USAGE_GUIDE.md`.
 

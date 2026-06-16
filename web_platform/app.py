@@ -854,6 +854,26 @@ INDEX_HTML = """<!doctype html>
       color: #fff;
     }
 
+    .direct-note {
+      min-height: 40px;
+      display: flex;
+      align-items: center;
+      grid-column: span 2;
+      color: var(--text-secondary);
+      font-size: 12.5px;
+      line-height: 1.4;
+      background: rgba(6, 182, 212, 0.06);
+      border: 1px solid rgba(6, 182, 212, 0.16);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+
+    @media (max-width: 900px) {
+      .direct-note {
+        grid-column: auto;
+      }
+    }
+
     .reject-btn {
       background: rgba(239, 68, 68, 0.08);
       border: 1px solid rgba(239, 68, 68, 0.25);
@@ -1115,6 +1135,24 @@ INDEX_HTML = """<!doctype html>
             </div>
             <button id="uploadBtn" type="submit" class="btn btn-submit">Xử lý video</button>
           </div>
+        </form>
+
+        <form id="imagePairForm">
+          <div class="card" style="margin-bottom: 20px;">
+            <h2 class="card-title">Upload nhanh nhiều ảnh</h2>
+            <div class="job-fields">
+              <div class="job-field">
+                <label for="directLowInput">Ảnh LOW</label>
+                <input id="directLowInput" name="low_images" type="file" accept="image/*" multiple required>
+              </div>
+              <div class="job-field">
+                <label for="directHighInput">Ảnh HIGH</label>
+                <input id="directHighInput" name="high_images" type="file" accept="image/*" multiple required>
+              </div>
+            </div>
+            <button id="imagePairBtn" type="submit" class="btn btn-submit">Xem trước batch ảnh</button>
+          </div>
+        </form>
 
           <div class="card">
             <div class="card-header-flex">
@@ -1236,7 +1274,6 @@ INDEX_HTML = """<!doctype html>
               </div>
             </div>
           </div>
-        </form>
       </aside>
 
       <!-- KHÔNG GIAN LÀM VIỆC CHÍNH -->
@@ -1295,9 +1332,14 @@ INDEX_HTML = """<!doctype html>
     let highOptions = [];
     let currentJobMeta = { submitted_by: "", objective_pairs: null, saved_count: 0 };
     let teamStats = { saved_count: 0, objective_pairs: 500, remaining_pairs: 500 };
+    let pendingDirectPair = null;
+    let directLowFiles = [];
+    let directHighFiles = [];
 
     const uploadForm = document.getElementById("uploadForm");
+    const imagePairForm = document.getElementById("imagePairForm");
     const uploadBtn = document.getElementById("uploadBtn");
+    const imagePairBtn = document.getElementById("imagePairBtn");
     const addPairBtn = document.getElementById("addPairBtn");
     const saveBtn = document.getElementById("saveBtn");
     const statusEl = document.getElementById("status");
@@ -1337,6 +1379,17 @@ INDEX_HTML = """<!doctype html>
       objectivePairsInput.addEventListener("input", syncJobMetaFromInputs);
     }
 
+    function clearPendingDirectBatch() {
+      if (pendingDirectPair) {
+        [...(pendingDirectPair.lowOptions || []), ...(pendingDirectPair.highOptions || [])].forEach(item => {
+          if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+        });
+      }
+      pendingDirectPair = null;
+      directLowFiles = [];
+      directHighFiles = [];
+    }
+
     // Default params reset handler
     const defaultParams = {
       frame_step: 5,
@@ -1354,7 +1407,7 @@ INDEX_HTML = """<!doctype html>
     };
     document.getElementById("resetParamsBtn").addEventListener("click", () => {
       for (const [key, val] of Object.entries(defaultParams)) {
-        const input = uploadForm.querySelector(`[name="${key}"]`);
+        const input = document.querySelector(`[name="${key}"]`);
         if (input) input.value = val;
       }
     });
@@ -1363,6 +1416,8 @@ INDEX_HTML = """<!doctype html>
       event.preventDefault();
       const file = videoInput.files[0];
       if (!file) return;
+
+      clearPendingDirectBatch();
 
       currentJobId = null;
       currentPairs = [];
@@ -1394,6 +1449,10 @@ INDEX_HTML = """<!doctype html>
 
       const body = new FormData(uploadForm);
       body.set("video", file);
+      for (const [key] of Object.entries(defaultParams)) {
+        const input = document.querySelector(`[name="${key}"]`);
+        if (input) body.set(key, input.value);
+      }
 
       try {
         const response = await fetch("/api/jobs", { method: "POST", body });
@@ -1410,6 +1469,90 @@ INDEX_HTML = """<!doctype html>
         uploadBtn.disabled = false;
         statusEl.innerHTML = `<span class="error-message"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg> Gửi yêu cầu thất bại: ${err.message}</span>`;
       }
+    });
+
+    imagePairForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      directLowFiles = Array.from(document.getElementById("directLowInput").files || []);
+      directHighFiles = Array.from(document.getElementById("directHighInput").files || []);
+      if (!directLowFiles.length || !directHighFiles.length) return;
+
+      clearPendingDirectBatch();
+      directLowFiles = Array.from(document.getElementById("directLowInput").files || []);
+      directHighFiles = Array.from(document.getElementById("directHighInput").files || []);
+      const directLowOptions = directLowFiles.map((file, index) => ({
+        idx: index,
+        file_index: index,
+        name: file.name,
+        path: URL.createObjectURL(file),
+        previewUrl: null,
+        brightness: null,
+        direct_upload: true
+      }));
+      const directHighOptions = directHighFiles.map((file, index) => ({
+        idx: index,
+        file_index: index,
+        name: file.name,
+        path: URL.createObjectURL(file),
+        previewUrl: null,
+        brightness: null,
+        direct_upload: true
+      }));
+      directLowOptions.forEach(item => item.previewUrl = item.path);
+      directHighOptions.forEach(item => item.previewUrl = item.path);
+
+      pendingDirectPair = {
+        lowOptions: directLowOptions,
+        highOptions: directHighOptions
+      };
+      currentJobId = null;
+      lowOptions = directLowOptions;
+      highOptions = directHighOptions;
+      currentJobMeta = {
+        submitted_by: submittedByInput ? submittedByInput.value.trim() : "",
+        objective_pairs: objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : null,
+        saved_count: 0
+      };
+      const initialPairCount = Math.min(directLowOptions.length, directHighOptions.length);
+      currentPairs = Array.from({ length: initialPairCount }, (_, index) => {
+        const low = directLowOptions[index];
+        const high = directHighOptions[index];
+        return {
+          pair_id: index,
+          segment_id: "direct",
+          mode: "direct_upload",
+          low_idx: low.idx,
+          high_idx: high.idx,
+          selected_high_idx: high.idx,
+          low_file_index: low.file_index,
+          high_file_index: high.file_index,
+          low_name: low.name,
+          high_name: high.name,
+          low_path: low.path,
+          high_path: high.path,
+          low_brightness: null,
+          high_brightness: null,
+          brightness_gap: null,
+          score: null,
+          good_matches: null,
+          inlier_ratio: null,
+          hog_hits: null,
+          accepted: true,
+          alternatives: []
+        };
+      });
+
+      summaryEl.innerHTML = "";
+      renderPairs(currentPairs);
+      renderObjectiveProgress();
+      saveBtn.disabled = false;
+      addPairBtn.disabled = lowOptions.length === 0 || highOptions.length === 0;
+      statusEl.innerHTML = `
+        <span class="success-message">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+          Đã tạo preview ${currentPairs.length} cặp từ ${directLowFiles.length} ảnh LOW và ${directHighFiles.length} ảnh HIGH. Các ảnh này sẽ được lưu chung một batch/video group khi bấm "Lưu cặp đã duyệt".
+        </span>
+      `;
     });
 
     async function pollJob() {
@@ -1479,7 +1622,7 @@ INDEX_HTML = """<!doctype html>
       const percent = teamTarget > 0 ? Math.min(Math.round((teamSaved / teamTarget) * 100), 100) : 0;
       const pieDeg = Math.min((teamSaved / Math.max(teamTarget, 1)) * 360, 360).toFixed(1);
       const saved = savedOverride === null ? Number(currentJobMeta.saved_count || 0) : Number(savedOverride || 0);
-      const detected = currentPairs.length || 0;
+      const detected = pendingDirectPair ? 0 : (currentPairs.length || 0);
 
       const doneClass = teamTarget > 0 && teamSaved >= teamTarget ? "done" : "";
       objectiveProgressEl.innerHTML = `
@@ -1529,6 +1672,23 @@ INDEX_HTML = """<!doctype html>
 
     fetchTeamStats();
 
+    async function parseJsonResponse(response) {
+      const text = await response.text();
+      let payload = {};
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch (err) {
+          payload = { detail: text };
+        }
+      }
+      if (!response.ok) {
+        const detail = payload.detail || payload.error || response.statusText || "Request failed";
+        throw new Error(`${response.status}: ${detail}`);
+      }
+      return payload;
+    }
+
     function optionLabel(alt) {
       const hog = Number(alt.hog_hits || 0);
       const warn = hog > 0 ? "⚠️ có người" : "";
@@ -1536,20 +1696,37 @@ INDEX_HTML = """<!doctype html>
     }
 
     function frameOptionLabel(frame) {
+      if (frame.direct_upload) {
+        return `${frame.idx + 1}. ${frame.name}`;
+      }
       return `idx ${frame.idx} | sáng ${Number(frame.brightness).toFixed(1)}`;
     }
 
     // Helper functions
     function findLowOption(idx) {
-      return lowOptions.find(item => item.idx === Number(idx));
+      return lowOptions.find(item => String(item.idx) === String(idx));
     }
 
     function findHighOption(idx) {
-      return highOptions.find(item => item.idx === Number(idx));
+      return highOptions.find(item => String(item.idx) === String(idx));
+    }
+
+    function imageSrc(path) {
+      if (!path) return "";
+      if (path.startsWith("blob:") || path.startsWith("data:") || path.startsWith("http://") || path.startsWith("https://")) {
+        return path;
+      }
+      return `/api/jobs/${currentJobId}/frame?path=${encodeURIComponent(path)}`;
+    }
+
+    function fmtNumber(value, digits = 2, fallback = "Upload trực tiếp") {
+      if (value === null || value === undefined || value === "") return fallback;
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(digits) : fallback;
     }
 
     function updatePairMeta(article, pair) {
-      article.querySelector(".gap-value").textContent = `Chênh sáng: ${Number(pair.brightness_gap || 0).toFixed(2)}`;
+      article.querySelector(".gap-value").textContent = `Chênh sáng: ${fmtNumber(pair.brightness_gap)}`;
       article.querySelector(".score-value").textContent = `Điểm: ${pair.score === null ? "Tự chọn" : Number(pair.score).toFixed(2)}`;
       article.querySelector(".matches-value").textContent = `Matches: ${pair.good_matches === null ? "Thủ công" : pair.good_matches}`;
       article.querySelector(".inlier-value").textContent = `Inlier: ${pair.inlier_ratio === null ? "Thủ công" : Number(pair.inlier_ratio).toFixed(2)}`;
@@ -1575,15 +1752,35 @@ INDEX_HTML = """<!doctype html>
       if (pairsCountEl) pairsCountEl.textContent = `${pairs.length} cặp`;
       
       pairsEl.innerHTML = pairs.map(pair => {
+        const isDirect = pair.mode === "direct_upload";
         const lowSelectOptions = lowOptions.map(frame => `
           <option value="${frame.idx}" ${frame.idx === pair.low_idx ? "selected" : ""}>${frameOptionLabel(frame)}</option>
         `).join("");
-        const alternativeMap = new Map(pair.alternatives.map(alt => [alt.high_idx, alt]));
+        const alternatives = pair.alternatives || [];
+        const alternativeMap = new Map(alternatives.map(alt => [alt.high_idx, alt]));
         const highSelectOptions = highOptions.map(frame => {
           const alt = alternativeMap.get(frame.idx);
           const label = alt ? optionLabel(alt) : frameOptionLabel(frame);
           return `<option value="${frame.idx}" ${frame.idx === pair.selected_high_idx ? "selected" : ""}>${label}</option>`;
         }).join("");
+        const controlsHtml = isDirect ? `
+                <label>Chọn ảnh LOW
+                  <select class="low-select">${lowSelectOptions}</select>
+                </label>
+                <label>Chọn ảnh HIGH
+                  <select class="alt-select">${highSelectOptions}</select>
+                </label>
+                <button type="button" class="reject-btn">Loại Cặp này</button>
+                <div class="direct-note">Batch upload trực tiếp: các cặp lưu trong lần này dùng chung một job/video group để tránh leakage khi chia train/val/test.</div>
+        ` : `
+                <label>Thay đổi Frame LOW
+                  <select class="low-select">${lowSelectOptions}</select>
+                </label>
+                <label>Thay đổi Frame HIGH
+                  <select class="alt-select">${highSelectOptions}</select>
+                </label>
+                <button type="button" class="reject-btn">Loại Cặp này</button>
+        `;
         return `
           <article class="pair" data-pair-id="${pair.pair_id}">
             <div class="pickbox">
@@ -1593,29 +1790,23 @@ INDEX_HTML = """<!doctype html>
               <div class="images">
                 <figure>
                   <div class="img-tag low">LOW (THIẾU SÁNG)</div>
-                  <img class="low-img" src="/api/jobs/${currentJobId}/frame?path=${encodeURIComponent(pair.low_path)}" alt="Frame LOW ${pair.low_idx}">
-                  <figcaption class="low-caption">Chỉ số LOW: #${pair.low_idx} — Sáng: ${Number(pair.low_brightness).toFixed(2)}</figcaption>
+                  <img class="low-img" src="${imageSrc(pair.low_path)}" alt="Frame LOW ${pair.low_idx}">
+                  <figcaption class="low-caption">LOW: ${isDirect ? pair.low_name || "ảnh upload trực tiếp" : `#${pair.low_idx} - Sáng: ${fmtNumber(pair.low_brightness)}`}</figcaption>
                 </figure>
                 <figure>
                   <div class="img-tag high">HIGH (ĐỦ SÁNG)</div>
-                  <img class="high-img" src="/api/jobs/${currentJobId}/frame?path=${encodeURIComponent(pair.high_path)}" alt="Frame HIGH ${pair.selected_high_idx}">
-                  <figcaption class="high-caption">Chỉ số HIGH: #${pair.selected_high_idx} — Sáng: ${Number(pair.high_brightness).toFixed(2)}</figcaption>
+                  <img class="high-img" src="${imageSrc(pair.high_path)}" alt="Frame HIGH ${pair.selected_high_idx}">
+                  <figcaption class="high-caption">HIGH: ${isDirect ? pair.high_name || "ảnh upload trực tiếp" : `#${pair.selected_high_idx} - Sáng: ${fmtNumber(pair.high_brightness)}`}</figcaption>
                 </figure>
               </div>
               <div class="controls">
-                <label>Thay đổi Frame LOW
-                  <select class="low-select">${lowSelectOptions}</select>
-                </label>
-                <label>Thay đổi Frame HIGH
-                  <select class="alt-select">${highSelectOptions}</select>
-                </label>
-                <button type="button" class="reject-btn">Loại Cặp này</button>
+                ${controlsHtml}
               </div>
               <div class="meta">
                 <span>Cặp #${pair.pair_id}</span>
-                <span>Đoạn tối: ${pair.segment_id === "manual" ? "Tự chọn thủ công" : `Phân đoạn ${pair.segment_id}`}</span>
+                <span>Đoạn tối: ${isDirect ? "Upload trực tiếp" : pair.segment_id === "manual" ? "Tự chọn thủ công" : `Phân đoạn ${pair.segment_id}`}</span>
                 <span class="score-value">Điểm: ${pair.score === null ? "Tự chọn" : Number(pair.score).toFixed(2)}</span>
-                <span class="gap-value">Chênh sáng: ${Number(pair.brightness_gap).toFixed(2)}</span>
+                <span class="gap-value">Chênh sáng: ${fmtNumber(pair.brightness_gap)}</span>
                 <span class="matches-value">Matches: ${pair.good_matches === null ? "Thủ công" : pair.good_matches}</span>
                 <span class="inlier-value">Inlier: ${pair.inlier_ratio === null ? "Thủ công" : Number(pair.inlier_ratio).toFixed(2)}</span>
                 <span class="warn hog-value" style="${Number(pair.hog_hits || 0) > 0 ? "" : "display:none"}">Cảnh báo: Phát hiện người (${pair.hog_hits || 0})</span>
@@ -1634,9 +1825,11 @@ INDEX_HTML = """<!doctype html>
           pair.low_idx = low.idx;
           pair.low_path = low.path;
           pair.low_brightness = low.brightness;
+          pair.low_file_index = low.file_index;
+          pair.low_name = low.name;
           pair.brightness_gap = Number(pair.high_brightness || 0) - Number(pair.low_brightness || 0);
-          article.querySelector(".low-img").src = `/api/jobs/${currentJobId}/frame?path=${encodeURIComponent(low.path)}`;
-          article.querySelector(".low-caption").textContent = `Chỉ số LOW: #${low.idx} — Sáng: ${Number(low.brightness).toFixed(2)}`;
+          article.querySelector(".low-img").src = imageSrc(low.path);
+          article.querySelector(".low-caption").textContent = pair.mode === "direct_upload" ? `LOW: ${low.name}` : `LOW: #${low.idx} - Sáng: ${fmtNumber(low.brightness)}`;
           updatePairMeta(article, pair);
         });
       });
@@ -1646,20 +1839,22 @@ INDEX_HTML = """<!doctype html>
           const article = event.target.closest(".pair");
           const pair = currentPairs.find(item => item.pair_id === Number(article.dataset.pairId));
           const highIdx = Number(event.target.value);
-          const alt = pair.alternatives.find(item => item.high_idx === highIdx);
+          const alt = (pair.alternatives || []).find(item => item.high_idx === highIdx);
           const frame = findHighOption(highIdx);
           if (!frame) return;
           pair.selected_high_idx = frame.idx;
           pair.high_idx = frame.idx;
           pair.high_path = frame.path;
           pair.high_brightness = frame.brightness;
+          pair.high_file_index = frame.file_index;
+          pair.high_name = frame.name;
           pair.brightness_gap = Number(pair.high_brightness || 0) - Number(pair.low_brightness || 0);
           pair.score = alt ? alt.score : null;
           pair.good_matches = alt ? alt.good_matches : null;
           pair.inlier_ratio = alt ? alt.inlier_ratio : null;
           pair.hog_hits = alt ? alt.hog_hits : null;
-          article.querySelector(".high-img").src = `/api/jobs/${currentJobId}/frame?path=${encodeURIComponent(frame.path)}`;
-          article.querySelector(".high-caption").textContent = `Chỉ số HIGH: #${frame.idx} — Sáng: ${Number(frame.brightness).toFixed(2)}`;
+          article.querySelector(".high-img").src = imageSrc(frame.path);
+          article.querySelector(".high-caption").textContent = pair.mode === "direct_upload" ? `HIGH: ${frame.name}` : `HIGH: #${frame.idx} - Sáng: ${fmtNumber(frame.brightness)}`;
           updatePairMeta(article, pair);
         });
       });
@@ -1680,10 +1875,15 @@ INDEX_HTML = """<!doctype html>
       const nextId = currentPairs.length ? Math.max(...currentPairs.map(item => item.pair_id)) + 1 : 0;
       currentPairs.push({
         pair_id: nextId,
-        segment_id: "manual",
+        segment_id: pendingDirectPair ? "direct" : "manual",
+        mode: pendingDirectPair ? "direct_upload" : "manual",
         low_idx: low.idx,
         high_idx: high.idx,
         selected_high_idx: high.idx,
+        low_file_index: low.file_index,
+        high_file_index: high.file_index,
+        low_name: low.name,
+        high_name: high.name,
         low_path: low.path,
         high_path: high.path,
         low_brightness: low.brightness,
@@ -1700,7 +1900,83 @@ INDEX_HTML = """<!doctype html>
       saveBtn.disabled = false;
     });
 
+    async function savePendingDirectPair() {
+      if (!pendingDirectPair) return;
+      const reviewed = Array.from(document.querySelectorAll(".pair")).map(article => {
+        const pair = currentPairs.find(item => item.pair_id === Number(article.dataset.pairId));
+        const checked = article.querySelector(".pick").checked;
+        return {
+          ...pair,
+          accepted: checked,
+          human_decision: checked ? "accepted_direct" : "rejected"
+        };
+      });
+      const acceptedCount = reviewed.filter(item => item.accepted).length;
+      if (!acceptedCount) {
+        clearPendingDirectBatch();
+        currentPairs = [];
+        renderPairs(currentPairs);
+        saveBtn.disabled = true;
+        statusEl.innerHTML = `<span class="error-message">Tất cả cặp ảnh đang bị bỏ chọn nên chưa lưu. Chọn lại ảnh nếu muốn upload.</span>`;
+        return;
+      }
+
+      saveBtn.disabled = true;
+      imagePairBtn.disabled = true;
+      statusEl.innerHTML = `
+        <div class="progress-container">
+          <div class="spinner"></div>
+          <span class="progress-text">Đang upload ${acceptedCount} cặp ảnh trực tiếp lên Cloudinary và lưu metadata...</span>
+        </div>
+      `;
+
+      const body = new FormData();
+      directLowFiles.forEach(file => body.append("low_images", file));
+      directHighFiles.forEach(file => body.append("high_images", file));
+      body.set("pairs_json", JSON.stringify(reviewed));
+      body.set("submitted_by", submittedByInput ? submittedByInput.value.trim() : "");
+      body.set("objective_pairs", objectivePairsInput && objectivePairsInput.value ? objectivePairsInput.value : 500);
+
+      try {
+        const response = await fetch("/api/image-pairs", { method: "POST", body });
+        const payload = await parseJsonResponse(response);
+
+        currentJobId = payload.job_id;
+        currentJobMeta = {
+          submitted_by: payload.submitted_by || (submittedByInput ? submittedByInput.value.trim() : ""),
+          objective_pairs: payload.objective_pairs || (objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : 500),
+          saved_count: payload.saved_count || payload.copied || 1
+        };
+        teamStats = {
+          saved_count: Number(payload.team_saved_count || 0),
+          objective_pairs: Number(payload.team_objective_pairs || 500),
+          remaining_pairs: Number(payload.team_remaining_pairs || 0)
+        };
+        clearPendingDirectBatch();
+        currentPairs = [];
+        renderPairs(currentPairs);
+        renderObjectiveProgress(currentJobMeta.saved_count);
+        imagePairForm.reset();
+        saveBtn.disabled = true;
+        statusEl.innerHTML = `
+          <span class="success-message">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+            Đã lưu thành công ${payload.copied} cặp ảnh trực tiếp trong cùng batch ${payload.job_id}. Tiến độ team: ${payload.team_saved_count}/${payload.team_objective_pairs}.
+          </span>
+        `;
+      } catch (err) {
+        saveBtn.disabled = false;
+        statusEl.innerHTML = `<span class="error-message">Lỗi khi lưu cặp ảnh trực tiếp: ${err.message}</span>`;
+      } finally {
+        imagePairBtn.disabled = false;
+      }
+    }
+
     saveBtn.addEventListener("click", async () => {
+      if (pendingDirectPair) {
+        await savePendingDirectPair();
+        return;
+      }
       if (!currentJobId) return;
       const reviewed = Array.from(document.querySelectorAll(".pair")).map(article => {
         const pair = currentPairs.find(item => item.pair_id === Number(article.dataset.pairId));
@@ -1726,7 +2002,7 @@ INDEX_HTML = """<!doctype html>
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ pairs: reviewed })
         });
-        const payload = await response.json();
+        const payload = await parseJsonResponse(response);
         currentJobMeta.saved_count = payload.saved_count || payload.copied || 0;
         currentJobMeta.objective_pairs = payload.objective_pairs || currentJobMeta.objective_pairs;
         currentJobMeta.submitted_by = payload.submitted_by || currentJobMeta.submitted_by;
@@ -1962,18 +2238,248 @@ def cleanup_job_files(job_id: str) -> None:
             path.unlink(missing_ok=True)
 
 
+def parse_objective(value) -> int | None:
+    try:
+        objective = int(value) if value not in ("", None) else None
+    except (TypeError, ValueError):
+        return None
+    return objective if objective and objective > 0 else None
+
+
+def safe_int(value, fallback: int | None = None) -> int | None:
+    if value in ("", None):
+        return fallback
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def safe_float(value, fallback: float | None = None) -> float | None:
+    if value in ("", None):
+        return fallback
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+@app.post("/api/image-pairs")
+async def create_image_pair(request: Request):
+    form = await request.form()
+    submitted_by = str(form.get("submitted_by") or "").strip() or "Không rõ"
+    objective_pairs = parse_objective(form.get("objective_pairs"))
+    job_id = uuid.uuid4().hex[:12]
+    direct_dir = JOB_DIR / job_id / "direct_pair"
+    direct_dir.mkdir(parents=True, exist_ok=True)
+    low_dir = direct_dir / "low"
+    high_dir = direct_dir / "high"
+    low_dir.mkdir(parents=True, exist_ok=True)
+    high_dir.mkdir(parents=True, exist_ok=True)
+
+    def image_suffix(filename: str | None) -> str:
+        suffix = Path(filename or "").suffix.lower()
+        return suffix if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} else ".png"
+
+    low_images = list(form.getlist("low_images"))
+    high_images = list(form.getlist("high_images"))
+    # Backward compatibility with the older one-low/one-high form names.
+    if not low_images and form.get("low_image") is not None:
+        low_images = [form.get("low_image")]
+    if not high_images and form.get("high_image") is not None:
+        high_images = [form.get("high_image")]
+    low_images = [item for item in low_images if hasattr(item, "file")]
+    high_images = [item for item in high_images if hasattr(item, "file")]
+    if not low_images or not high_images:
+        raise HTTPException(status_code=400, detail="Cần upload ít nhất 1 ảnh LOW và 1 ảnh HIGH.")
+
+    low_paths: list[Path] = []
+    high_paths: list[Path] = []
+    for idx, image in enumerate(low_images):
+        path = low_dir / f"low_{idx:04d}{image_suffix(image.filename)}"
+        with path.open("wb") as handle:
+            shutil.copyfileobj(image.file, handle)
+        low_paths.append(path)
+    for idx, image in enumerate(high_images):
+        path = high_dir / f"high_{idx:04d}{image_suffix(image.filename)}"
+        with path.open("wb") as handle:
+            shutil.copyfileobj(image.file, handle)
+        high_paths.append(path)
+
+    pairs_raw = str(form.get("pairs_json") or "").strip()
+    if pairs_raw:
+        try:
+            submitted_pairs = json.loads(pairs_raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="pairs_json không hợp lệ.") from exc
+    else:
+        submitted_pairs = [
+            {
+                "pair_id": idx,
+                "low_file_index": idx,
+                "high_file_index": idx,
+                "accepted": True,
+                "human_decision": "accepted_direct",
+            }
+            for idx in range(min(len(low_paths), len(high_paths)))
+        ]
+
+    reviewed_pairs: list[dict] = []
+    db_pair_rows: list[dict] = []
+    for fallback_id, item in enumerate(submitted_pairs):
+        try:
+            low_index = int(item.get("low_file_index", item.get("low_idx", 0)))
+            high_index = int(item.get("high_file_index", item.get("selected_high_idx", item.get("high_idx", 0))))
+        except (TypeError, ValueError):
+            continue
+        if low_index < 0 or low_index >= len(low_paths) or high_index < 0 or high_index >= len(high_paths):
+            continue
+        pair_id = int(item.get("pair_id", fallback_id))
+        accepted = bool(item.get("accepted", True))
+        low_path = low_paths[low_index]
+        high_path = high_paths[high_index]
+        decision = str(item.get("human_decision") or ("accepted_direct" if accepted else "rejected"))[:20]
+        reviewed_pairs.append(
+            {
+                "pair_id": pair_id,
+                "job_id": job_id,
+                "submitted_by": submitted_by,
+                "objective_pairs": objective_pairs,
+                "accepted": accepted,
+                "human_decision": decision,
+                "low_path": str(low_path),
+                "high_path": str(high_path),
+                "score": None,
+            }
+        )
+        db_pair_rows.append(
+            {
+                "pair_id": pair_id,
+                "low_index": low_index,
+                "high_index": high_index,
+                "low_path": str(low_path),
+                "high_path": str(high_path),
+                "accepted": accepted,
+            }
+        )
+
+    if not reviewed_pairs:
+        raise HTTPException(status_code=400, detail="Không có cặp ảnh hợp lệ để lưu.")
+
+    jobs[job_id] = {
+        "status": "done",
+        "message": "Đã lưu batch ảnh trực tiếp",
+        "pairs": [],
+        "summary": {
+            "mode": "direct_image_batch",
+            "low_images": len(low_paths),
+            "high_images": len(high_paths),
+            "submitted_pairs": len(reviewed_pairs),
+        },
+        "submitted_by": submitted_by,
+        "objective_pairs": objective_pairs,
+        "saved_count": 0,
+    }
+
+    db = SessionLocal()
+    try:
+        start_idx = db.query(DBReviewedPair).count()
+    finally:
+        db.close()
+
+    try:
+        copied, saved_records, storage_mode = save_reviewed_outputs(job_id, reviewed_pairs, start_idx)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi upload/lưu file ảnh trực tiếp: {exc}") from exc
+    if not saved_records:
+        raise HTTPException(status_code=400, detail="Không lưu được cặp ảnh. Kiểm tra định dạng file ảnh.")
+    saved_by_source_pair = {record["source_pair_id"]: record for record in saved_records}
+
+    db = SessionLocal()
+    try:
+        db_job = DBJob(
+            job_id=job_id,
+            status="done",
+            message="Đã lưu batch ảnh trực tiếp",
+            video_name=f"direct_image_batch_{job_id}",
+            submitted_by=submitted_by,
+            objective_pairs=objective_pairs,
+            summary_json=json.dumps({
+                "mode": "direct_image_batch",
+                "low_images": len(low_paths),
+                "high_images": len(high_paths),
+                "submitted_pairs": len(reviewed_pairs),
+            }),
+        )
+        db.add(db_job)
+        for row in db_pair_rows:
+            db.add(
+                DBPair(
+                    job_id=job_id,
+                    pair_id=row["pair_id"],
+                    segment_id="direct",
+                    low_idx=row["low_index"],
+                    high_idx=row["high_index"],
+                    selected_high_idx=row["high_index"],
+                    low_path=row["low_path"],
+                    high_path=row["high_path"],
+                    accepted=row["accepted"],
+                    alternatives_json="[]",
+                )
+            )
+        for item in reviewed_pairs:
+            saved_record = saved_by_source_pair.get(item["pair_id"])
+            if not saved_record:
+                continue
+            db.add(
+                DBReviewedPair(
+                    dataset_pair_id=saved_record["pair_id"],
+                    job_id=job_id,
+                    submitted_by=submitted_by,
+                    source_pair_id=item["pair_id"],
+                    low_path=item["low_path"],
+                    high_path=item["high_path"],
+                    saved_low=saved_record["saved_low"],
+                    saved_high=saved_record["saved_high"],
+                    score=None,
+                    human_decision=item.get("human_decision", "accepted_direct")[:20],
+                )
+            )
+        db.commit()
+        saved_count = db.query(DBReviewedPair).filter(DBReviewedPair.job_id == job_id).count()
+        team_saved_count = db.query(DBReviewedPair).count()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Lỗi lưu metadata cặp ảnh: {exc}") from exc
+    finally:
+        db.close()
+
+    jobs[job_id]["saved_count"] = saved_count
+    if storage_mode == "cloudinary" and cleanup_after_save():
+        cleanup_job_files(job_id)
+
+    return {
+        "job_id": job_id,
+        "copied": copied,
+        "storage": storage_mode,
+        "dataset_dir": "Cloudinary" if storage_mode == "cloudinary" else str(DATASET_DIR),
+        "submitted_by": submitted_by,
+        "objective_pairs": objective_pairs,
+        "saved_count": saved_count,
+        "team_objective_pairs": TEAM_OBJECTIVE_PAIRS,
+        "team_saved_count": team_saved_count,
+        "team_remaining_pairs": max(TEAM_OBJECTIVE_PAIRS - team_saved_count, 0),
+        "source_group": f"direct_image_batch_{job_id}",
+        "saved_pairs": saved_records,
+    }
+
+
 @app.post("/api/jobs")
 async def create_job(request: Request, video: UploadFile = File(...)):
     form = await request.form()
     config = config_from_form(dict(form))
     submitted_by = str(form.get("submitted_by") or "").strip() or "Không rõ"
-    objective_raw = form.get("objective_pairs")
-    try:
-        objective_pairs = int(objective_raw) if objective_raw not in ("", None) else None
-    except (TypeError, ValueError):
-        objective_pairs = None
-    if objective_pairs is not None and objective_pairs <= 0:
-        objective_pairs = None
+    objective_pairs = parse_objective(form.get("objective_pairs"))
     suffix = Path(video.filename or "upload.mp4").suffix or ".mp4"
     job_id = uuid.uuid4().hex[:12]
     video_path = UPLOAD_DIR / f"{job_id}{suffix}"
@@ -2153,7 +2659,10 @@ async def save_pairs(job_id: str, request: Request):
     finally:
         db.close()
 
-    copied, saved_records, storage_mode = save_reviewed_outputs(job_id, reviewed_pairs, start_idx)
+    try:
+        copied, saved_records, storage_mode = save_reviewed_outputs(job_id, reviewed_pairs, start_idx)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi upload/lưu file cặp ảnh: {exc}") from exc
     saved_by_source_pair = {record["source_pair_id"]: record for record in saved_records}
 
     # Save metadata to DB
@@ -2169,15 +2678,15 @@ async def save_pairs(job_id: str, request: Request):
             db_pair = db.query(DBPair).filter(DBPair.job_id == job_id, DBPair.pair_id == item["pair_id"]).first()
             if db_pair:
                 db_pair.accepted = bool(item.get("accepted", True))
-                db_pair.selected_high_idx = int(item.get("selected_high_idx", db_pair.selected_high_idx))
+                db_pair.selected_high_idx = safe_int(item.get("selected_high_idx"), db_pair.selected_high_idx)
                 # If they rematched LOW/HIGH, update these fields as well
-                db_pair.low_idx = int(item.get("low_idx", db_pair.low_idx))
-                db_pair.high_idx = int(item.get("high_idx", db_pair.high_idx))
+                db_pair.low_idx = safe_int(item.get("low_idx"), db_pair.low_idx)
+                db_pair.high_idx = safe_int(item.get("high_idx"), db_pair.high_idx)
                 db_pair.low_path = str(item.get("low_path", db_pair.low_path))
                 db_pair.high_path = str(item.get("high_path", db_pair.high_path))
-                db_pair.low_brightness = float(item.get("low_brightness", db_pair.low_brightness))
-                db_pair.high_brightness = float(item.get("high_brightness", db_pair.high_brightness))
-                db_pair.brightness_gap = float(item.get("brightness_gap", db_pair.brightness_gap))
+                db_pair.low_brightness = safe_float(item.get("low_brightness"), db_pair.low_brightness)
+                db_pair.high_brightness = safe_float(item.get("high_brightness"), db_pair.high_brightness)
+                db_pair.brightness_gap = safe_float(item.get("brightness_gap"), db_pair.brightness_gap)
                 db_pair.score = item.get("score", db_pair.score)
                 db_pair.good_matches = item.get("good_matches", db_pair.good_matches)
                 db_pair.inlier_ratio = item.get("inlier_ratio", db_pair.inlier_ratio)
@@ -2195,7 +2704,7 @@ async def save_pairs(job_id: str, request: Request):
                     saved_low=saved_record["saved_low"],
                     saved_high=saved_record["saved_high"],
                     score=item.get("score"),
-                    human_decision=item.get("human_decision", "accepted")
+                    human_decision=str(item.get("human_decision", "accepted"))[:20]
                 )
                 db.add(db_reviewed)
                 
