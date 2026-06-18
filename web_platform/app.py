@@ -1142,6 +1142,10 @@ INDEX_HTML = """<!doctype html>
             <h2 class="card-title">Upload nhanh nhiều ảnh</h2>
             <div class="job-fields">
               <div class="job-field">
+                <label for="directSubmittedByInput">Người nộp</label>
+                <input id="directSubmittedByInput" name="submitted_by" type="text" maxlength="120" placeholder="VD: Nguyễn Văn A" required>
+              </div>
+              <div class="job-field">
                 <label for="directLowInput">Ảnh LOW</label>
                 <input id="directLowInput" name="low_images" type="file" accept="image/*" multiple required>
               </div>
@@ -1352,6 +1356,7 @@ INDEX_HTML = """<!doctype html>
     const videoInput = document.getElementById("videoInput");
     const fileInfo = document.getElementById("fileInfo");
     const submittedByInput = document.getElementById("submittedByInput");
+    const directSubmittedByInput = document.getElementById("directSubmittedByInput");
     const objectivePairsInput = document.getElementById("objectivePairsInput");
     if (videoInput && fileInfo) {
       videoInput.addEventListener("change", (e) => {
@@ -1372,8 +1377,25 @@ INDEX_HTML = """<!doctype html>
       renderObjectiveProgress();
     }
 
+    function syncDirectJobMetaFromInputs() {
+      currentJobMeta.submitted_by = directSubmittedByInput ? directSubmittedByInput.value.trim() : "";
+      currentJobMeta.objective_pairs = objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : null;
+      renderObjectiveProgress();
+    }
+
+    function getVideoSubmitter() {
+      return submittedByInput ? submittedByInput.value.trim() : "";
+    }
+
+    function getDirectSubmitter() {
+      return directSubmittedByInput ? directSubmittedByInput.value.trim() : "";
+    }
+
     if (submittedByInput) {
       submittedByInput.addEventListener("input", syncJobMetaFromInputs);
+    }
+    if (directSubmittedByInput) {
+      directSubmittedByInput.addEventListener("input", syncDirectJobMetaFromInputs);
     }
     if (objectivePairsInput) {
       objectivePairsInput.addEventListener("input", syncJobMetaFromInputs);
@@ -1424,7 +1446,7 @@ INDEX_HTML = """<!doctype html>
       lowOptions = [];
       highOptions = [];
       currentJobMeta = {
-        submitted_by: submittedByInput ? submittedByInput.value.trim() : "",
+        submitted_by: getVideoSubmitter(),
         objective_pairs: objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : null,
         saved_count: 0
       };
@@ -1509,7 +1531,7 @@ INDEX_HTML = """<!doctype html>
       lowOptions = directLowOptions;
       highOptions = directHighOptions;
       currentJobMeta = {
-        submitted_by: submittedByInput ? submittedByInput.value.trim() : "",
+        submitted_by: getDirectSubmitter(),
         objective_pairs: objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : null,
         saved_count: 0
       };
@@ -1934,7 +1956,7 @@ INDEX_HTML = """<!doctype html>
       directLowFiles.forEach(file => body.append("low_images", file));
       directHighFiles.forEach(file => body.append("high_images", file));
       body.set("pairs_json", JSON.stringify(reviewed));
-      body.set("submitted_by", submittedByInput ? submittedByInput.value.trim() : "");
+      body.set("submitted_by", getDirectSubmitter());
       body.set("objective_pairs", objectivePairsInput && objectivePairsInput.value ? objectivePairsInput.value : 500);
 
       try {
@@ -1943,7 +1965,7 @@ INDEX_HTML = """<!doctype html>
 
         currentJobId = payload.job_id;
         currentJobMeta = {
-          submitted_by: payload.submitted_by || (submittedByInput ? submittedByInput.value.trim() : ""),
+          submitted_by: payload.submitted_by || getDirectSubmitter(),
           objective_pairs: payload.objective_pairs || (objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : 500),
           saved_count: payload.saved_count || payload.copied || 1
         };
