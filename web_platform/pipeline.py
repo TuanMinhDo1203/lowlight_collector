@@ -296,6 +296,147 @@ def candidate_is_valid(good_matches: int, inlier_ratio: float, edge_valid: bool,
     )
 
 
+def match_image_groups(low_paths: list[Path], reference_paths: list[Path], config: PipelineConfig | None = None) -> dict:
+    config = config or PipelineConfig()
+    low_records = []
+    reference_records = []
+    for idx, path in enumerate(low_paths):
+        image = cv2.imread(str(path))
+        if image is not None:
+            low_records.append((idx, path, image, compute_brightness(image)))
+    for idx, path in enumerate(reference_paths):
+        image = cv2.imread(str(path))
+        if image is not None:
+            reference_records.append((idx, path, image, compute_brightness(image)))
+    if not low_records or not reference_records:
+        raise RuntimeError("Không đọc được ảnh LOW hoặc reference hợp lệ để matching.")
+
+    candidates = []
+    for low_idx, low_path, low_img, low_brightness in low_records:
+        for reference_idx, reference_path, reference_img, reference_brightness in reference_records:
+            _, good_matches, inlier_ratio = sift_check(low_img, reference_img, config)
+            edge_valid, edge_stats = edge_structure_check(low_img, reference_img, config)
+            hog_hits = detect_hog_person(reference_img)
+            score = structure_score(
+                good_matches,
+                inlier_ratio,
+                edge_valid,
+                edge_stats,
+                0,
+                0,
+                hog_hits,
+                config,
+            )
+            brightness_gap = reference_brightness - low_brightness
+            candidates.append(
+                {
+                    "low_idx": low_idx,
+                    "high_idx": reference_idx,
+                    "low_path": str(low_path),
+                    "high_path": str(reference_path),
+                    "low_brightness": low_brightness,
+                    "high_brightness": reference_brightness,
+                    "brightness_gap": brightness_gap,
+                    "score": score,
+                    "good_matches": good_matches,
+                    "inlier_ratio": inlier_ratio,
+                    "hog_hits": hog_hits,
+                    "valid": brightness_gap >= config.min_brightness_gap
+                    and candidate_is_valid(good_matches, inlier_ratio, edge_valid, score, config),
+                }
+            )
+
+    assigned_lows = set()
+    assigned_references = set()
+    selected = []
+    for candidate in sorted(candidates, key=lambda item: (item["valid"], item["score"]), reverse=True):
+        if candidate["low_idx"] in assigned_lows or candidate["high_idx"] in assigned_references:
+            continue
+        selected.append(candidate)
+        assigned_lows.add(candidate["low_idx"])
+        assigned_references.add(candidate["high_idx"])
+        if len(selected) >= min(len(low_records), len(reference_records)):
+            break
+
+    pairs = []
+    for pair_id, item in enumerate(selected):
+        alternatives = sorted(
+            (candidate for candidate in candidates if candidate["low_idx"] == item["low_idx"]),
+            key=lambda candidate: (candidate["valid"], candidate["score"]),
+            reverse=True,
+        )[: config.alternatives_per_low]
+        pairs.append(
+            {
+                "pair_id": pair_id,
+                "segment_id": "direct_match",
+                "mode": "direct_upload",
+                "low_idx": item["low_idx"],
+                "high_idx": item["high_idx"],
+                "selected_high_idx": item["high_idx"],
+                "low_file_index": item["low_idx"],
+                "high_file_index": item["high_idx"],
+                "low_name": low_paths[item["low_idx"]].name,
+                "high_name": reference_paths[item["high_idx"]].name,
+                "low_path": item["low_path"],
+                "high_path": item["high_path"],
+                "low_brightness": item["low_brightness"],
+                "high_brightness": item["high_brightness"],
+                "brightness_gap": item["brightness_gap"],
+                "score": item["score"],
+                "good_matches": item["good_matches"],
+                "inlier_ratio": item["inlier_ratio"],
+                "hog_hits": item["hog_hits"],
+                "accepted": True,
+                "alternatives": [
+                    {
+                        "high_idx": alternative["high_idx"],
+                        "high_path": alternative["high_path"],
+                        "high_brightness": alternative["high_brightness"],
+                        "brightness_gap": alternative["brightness_gap"],
+                        "score": alternative["score"],
+                        "good_matches": alternative["good_matches"],
+                        "inlier_ratio": alternative["inlier_ratio"],
+                        "hog_hits": alternative["hog_hits"],
+                    }
+                    for alternative in alternatives
+                ],
+            }
+        )
+
+    return {
+        "pairs": pairs,
+        "low_options": [
+            {
+                "idx": idx,
+                "file_index": idx,
+                "name": path.name,
+                "path": str(path),
+                "brightness": brightness,
+                "direct_upload": True,
+            }
+            for idx, path, _, brightness in low_records
+        ],
+        "high_options": [
+            {
+                "idx": idx,
+                "file_index": idx,
+                "name": path.name,
+                "path": str(path),
+                "brightness": brightness,
+                "direct_upload": True,
+            }
+            for idx, path, _, brightness in reference_records
+        ],
+        "summary": {
+            "mode": "direct_group_matching",
+            "low_images": len(low_records),
+            "reference_images": len(reference_records),
+            "candidates": len(candidates),
+            "selected_pairs": len(pairs),
+        },
+    }
+
+
 def collect_decisions(frame_paths: list[Path], brightness_values: np.ndarray, config: PipelineConfig) -> list[dict]:
     decisions: list[dict] = []
     for segment_id, (start_idx, end_idx) in enumerate(find_dark_segments(brightness_values, config)):

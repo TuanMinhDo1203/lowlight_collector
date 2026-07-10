@@ -180,9 +180,9 @@ Members on the same LAN can use the machine IP with port `8000`.
 Reviewed output is saved to:
 
 ```text
-web_platform/web_data/selected_dataset/low
-web_platform/web_data/selected_dataset/high
-web_platform/web_data/selected_dataset/metadata/reviewed_pairs.csv
+drive:LLIE_Dataset/raw/low
+drive:LLIE_Dataset/raw/reference
+Database reviewed pair metadata with rclone remote paths
 ```
 
 ## Web Parameters Exposed To Users
@@ -214,4 +214,3 @@ The best direction is:
 - Preserve alternatives and metadata.
 - Let humans review and rematch pairs in the web UI.
 - Save final reviewed data for training.
-

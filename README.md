@@ -2,12 +2,14 @@
 
 Web platform để upload video, tự tách các cặp ảnh LOW/HIGH, cho user review lại LOW/HIGH thủ công, rồi lưu dataset đã duyệt.
 
+Ngoài video, form upload ảnh nhận riêng hai nhóm LOW/reference, chạy matching để đề xuất cặp trước khi review, rồi cho chọn dùng chung `job_id` hoặc mỗi cặp một `job_id` riêng.
+
 App có tracking cho team và từng video:
 
 - **Người nộp**: lưu tên member upload video.
 - **Mục tiêu số cặp ảnh**: hiển thị đã lưu bao nhiêu cặp và còn thiếu bao nhiêu cặp.
 - Mục tiêu team mặc định: **500 cặp ảnh**.
-- Ảnh final có thể lưu lên Cloudinary nếu cấu hình biến môi trường Cloudinary.
+- Ảnh final được lưu lên Google Drive thông qua rclone; nếu rclone chưa sẵn sàng, thao tác lưu sẽ báo lỗi.
 - Metadata được lưu vào Supabase Postgres hoặc Postgres tương thích.
 
 ## Chạy Local
@@ -20,7 +22,7 @@ cp .env.example .env
 uvicorn web_platform.app:app --host 0.0.0.0 --port 8000
 ```
 
-Điền `DATABASE_URL` và Cloudinary credentials vào `.env` nếu muốn test Supabase/Cloudinary local. File `.env` đã được ignore, không commit.
+Điền `DATABASE_URL` và các biến `RCLONE_*` vào `.env`. File `.env` đã được ignore, không commit.
 
 Mở:
 
@@ -34,10 +36,10 @@ Repo đã có `render.yaml`, gồm:
 
 - Web service FastAPI
 - Supabase Postgres để lưu metadata job/pair
-- Cloudinary để lưu ảnh LOW/HIGH final lâu dài
+- Google Drive qua rclone để lưu ảnh LOW/reference final lâu dài
 - Python pinned ở `3.11.15` qua `PYTHON_VERSION` và `.python-version`
 
-Render free không hỗ trợ persistent disk, nên app dùng `web_platform/web_data` làm nơi xử lý tạm. Sau khi lưu cặp đã duyệt, ảnh final được upload lên Cloudinary và file tạm có thể được cleanup.
+App dùng `web_platform/web_data` làm nơi xử lý tạm. Sau khi lưu cặp đã duyệt thành công, ảnh final được upload lên Google Drive và file tạm được cleanup.
 
 ## Supabase Env Var
 
@@ -49,21 +51,24 @@ DATABASE_URL=<supabase_postgres_connection_string>
 
 Nếu Supabase đưa URL dạng `postgres://...`, app sẽ tự đổi sang `postgresql://...` cho SQLAlchemy.
 
-## Cloudinary Env Vars
+## Rclone Env Vars
 
-Tạo Cloudinary account, lấy API credentials rồi điền các biến này trong Render:
+Rclone phải được cài trên host và remote `drive` phải được cấu hình trước. Điền các biến sau:
 
 ```text
-CLOUDINARY_CLOUD_NAME=<cloud_name>
-CLOUDINARY_API_KEY=<api_key>
-CLOUDINARY_API_SECRET=<api_secret>
-CLOUDINARY_FOLDER=lowlight_datasets
-CLEANUP_AFTER_SAVE=true
+RCLONE_REMOTE=drive
+RCLONE_CONFIG=/home/<username>/.config/rclone/rclone.conf
+RCLONE_DATASET_ROOT=LLIE_Dataset
 ```
 
-Nếu muốn dùng `CLOUDINARY_URL` thay 3 biến riêng cũng được, nhưng `render.yaml` hiện khai báo 3 biến riêng cho rõ.
+Ảnh được lưu theo cấu trúc:
 
-Nếu chưa cấu hình Cloudinary, app fallback lưu local vào `web_platform/web_data/selected_dataset`, nhưng dữ liệu local trên Render free có thể mất sau restart/redeploy.
+```text
+drive:LLIE_Dataset/raw/low/<filename>
+drive:LLIE_Dataset/raw/reference/<filename>
+```
+
+Không đặt `rclone.conf` trong repository. Khi deploy, provision rclone binary và config bằng cơ chế Secret File của nền tảng, rồi đặt `RCLONE_CONFIG` trỏ tới file đó. Nếu rclone, remote hoặc config lỗi, thao tác lưu sẽ báo lỗi thay vì fallback local.
 
 Các bước:
 
@@ -72,7 +77,7 @@ Các bước:
 3. Chọn **New > Blueprint**.
 4. Connect GitHub repo này.
 5. Render đọc `render.yaml` và tạo web service.
-6. Điền `DATABASE_URL` từ Supabase và credentials Cloudinary trong Environment.
+6. Điền `DATABASE_URL`, các biến `RCLONE_*`, và provision `rclone.conf` dưới dạng secret ngoài repository.
 7. Deploy xong mở URL Render cấp.
 
 ## Kiểm Tra Sau Deploy
@@ -89,7 +94,7 @@ Kết quả tốt sẽ có:
 {
   "app": "ok",
   "database": {"ok": true},
-  "cloudinary": {"configured": true, "ok": true},
+  "rclone": {"configured": true, "ok": true},
   "team_objective_pairs": 500
 }
 ```
@@ -99,6 +104,8 @@ Kiểm tra progress dataset:
 ```text
 https://<render-service-url>/api/stats
 ```
+
+Progress được đếm trực tiếp từ các cặp filename khớp nhau trong `raw/low` và `raw/reference`, không lấy từ số row trong database.
 
 ## File Chính
 

@@ -4,12 +4,14 @@ Web app local để tạo dataset cặp ảnh thiếu sáng/đủ sáng từ vid
 
 Luồng sử dụng:
 
-1. Tải video lên để pipeline tự tìm cặp, hoặc upload nhanh một batch ảnh LOW/HIGH có sẵn.
+1. Tải video lên để pipeline tự tìm cặp, hoặc upload riêng hai nhóm ảnh LOW và reference có sẵn.
 2. Chỉnh tham số pipeline nếu cần.
 3. Review các cặp LOW/HIGH được chọn tự động.
 4. Nếu cặp chưa đúng, đổi **Frame LOW** hoặc **Frame HIGH** bằng dropdown.
 5. Dùng **Thêm cặp thủ công** nếu pipeline bỏ sót một cặp tốt.
-6. Loại cặp xấu hoặc lưu các cặp đã duyệt. Với upload nhanh batch ảnh, app sẽ hiển thị preview trước, cho đổi LOW/HIGH bằng dropdown; chỉ khi bấm **Lưu cặp đã duyệt** thì ảnh mới được lưu lên Cloudinary/Supabase. Các cặp trong một lần upload batch dùng chung `job_id`/source group để sau này split dataset tránh leakage.
+6. Với hai nhóm ảnh có sẵn, app chạy SIFT/edge matching như pipeline video để đề xuất cặp trước; dùng dropdown để chỉnh lại LOW/reference, thêm cặp hoặc loại cặp nếu cần. Chỉ khi bấm **Lưu cặp đã duyệt** thì các cặp accepted mới được lưu lên Google Drive/Supabase. Dropdown **Cách gán job_id / source group** cho phép chọn cả batch dùng chung một `job_id` hoặc mỗi cặp accepted dùng một `job_id` riêng.
+
+Khi lưu, thanh progress hiển thị phần trăm, số file và số cặp đã upload xong lên Google Drive. Tiến độ được cập nhật sau từng lệnh `rclone copyto`.
 
 Hướng dẫn tham số chi tiết nằm ở `WEB_USAGE_GUIDE.md`.
 
@@ -38,18 +40,13 @@ http://YOUR_LOCAL_IP:8000
 
 Nếu không cùng mạng, dùng private tunnel như Tailscale hoặc Cloudflare Tunnel và trỏ vào port `8000`.
 
-Nếu chạy local hoặc chưa cấu hình Cloudinary, các cặp đã chọn được lưu vào:
+Khi bấm lưu, ảnh LOW/reference final được upload qua rclone theo folder:
 
 ```text
-web_data/selected_dataset/low
-web_data/selected_dataset/high
+drive:LLIE_Dataset/raw/low
+drive:LLIE_Dataset/raw/reference
 ```
 
-Khi deploy Render free với Cloudinary, ảnh LOW/HIGH final được upload lên Cloudinary theo folder:
+`job_id` vẫn được lưu trong metadata để phân biệt source group. Chế độ **Mỗi cặp một job_id/source group riêng** chỉ thay đổi metadata grouping; file ảnh vẫn nằm trong hai thư mục dataset chuẩn ở trên.
 
-```text
-lowlight_datasets/<job_id>/low
-lowlight_datasets/<job_id>/high
-```
-
-Supabase Postgres lưu metadata gồm `job_id`, `submitted_by`, đường dẫn ảnh gốc tạm thời và URL Cloudinary đã lưu.
+Supabase Postgres lưu metadata gồm `job_id`, `submitted_by`, đường dẫn ảnh gốc tạm thời và remote path trên Google Drive. Backend cung cấp `/api/storage/file` để đọc ảnh từ Drive mà không đưa `rclone.conf` hoặc token ra frontend.

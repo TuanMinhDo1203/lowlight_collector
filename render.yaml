@@ -11,13 +11,9 @@ services:
         value: "true"
       - key: PYTHON_VERSION
         value: "3.11.15"
-      - key: CLOUDINARY_CLOUD_NAME
+      - key: RCLONE_REMOTE
+        value: drive
+      - key: RCLONE_CONFIG
         sync: false
-      - key: CLOUDINARY_API_KEY
-        sync: false
-      - key: CLOUDINARY_API_SECRET
-        sync: false
-      - key: CLOUDINARY_FOLDER
-        value: lowlight_datasets
-      - key: CLEANUP_AFTER_SAVE
-        value: "true"
+      - key: RCLONE_DATASET_ROOT
+        value: LLIE_Dataset

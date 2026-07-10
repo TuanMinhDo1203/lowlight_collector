@@ -35,10 +35,11 @@ http://YOUR_LOCAL_IP:8000
 Output sẽ nằm ở:
 
 ```text
-web_platform/web_data/selected_dataset/low
-web_platform/web_data/selected_dataset/high
-web_platform/web_data/selected_dataset/metadata/reviewed_pairs.csv
+drive:LLIE_Dataset/raw/low
+drive:LLIE_Dataset/raw/reference
 ```
+
+Metadata và remote path được lưu trong database.
 
 ## Ý Nghĩa Tham Số
 

@@ -1,140 +1,188 @@
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import subprocess
 import tempfile
-from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-
-def first_env(*keys: str) -> str | None:
-    for key in keys:
-        value = os.environ.get(key)
-        if value:
-            return value
-    return None
+RCLONE_TIMEOUT_SECONDS = 300
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
-def cloudinary_enabled() -> bool:
-    if os.environ.get("CLOUDINARY_URL"):
-        return True
-    return not missing_cloudinary_vars()
+def rclone_remote() -> str:
+    return os.environ.get("RCLONE_REMOTE", "").strip().rstrip(":")
 
 
-def missing_cloudinary_vars() -> list[str]:
-    if os.environ.get("CLOUDINARY_URL"):
-        return []
+def rclone_config_path() -> Path | None:
+    value = os.environ.get("RCLONE_CONFIG", "").strip()
+    return Path(value).expanduser() if value else None
+
+
+def rclone_dataset_root() -> str:
+    return os.environ.get("RCLONE_DATASET_ROOT", "").strip().strip("/")
+
+
+def remote_dataset_root() -> str:
+    remote = rclone_remote()
+    root = rclone_dataset_root()
+    if not remote or not root:
+        raise RuntimeError("Rclone storage is not configured.")
+    return f"{remote}:{root}"
+
+
+def missing_rclone_settings() -> list[str]:
     missing = []
-    if not first_env("CLOUDINARY_CLOUD_NAME", "CLOUD_NAME", "CLOUDINARY_NAME"):
-        missing.append("CLOUDINARY_CLOUD_NAME")
-    if not first_env("CLOUDINARY_API_KEY", "CLOUDINARY_KEY"):
-        missing.append("CLOUDINARY_API_KEY")
-    if not first_env("CLOUDINARY_API_SECRET", "CLOUDINARY_SECRET", "CLOUDINARY_API_SECRET_KEY"):
-        missing.append("CLOUDINARY_API_SECRET")
+    if not rclone_remote():
+        missing.append("RCLONE_REMOTE")
+    if not rclone_config_path():
+        missing.append("RCLONE_CONFIG")
+    if not rclone_dataset_root():
+        missing.append("RCLONE_DATASET_ROOT")
     return missing
 
 
-def cloudinary_env_diagnostics() -> dict:
-    api_key = first_env("CLOUDINARY_API_KEY", "CLOUDINARY_KEY") or ""
+def rclone_enabled() -> bool:
+    config = rclone_config_path()
+    return not missing_rclone_settings() and config is not None and config.is_file() and shutil.which("rclone") is not None
+
+
+def _safe_error(stderr: str) -> str:
+    message = (stderr or "Unknown rclone error").strip()
+    config = rclone_config_path()
+    if config:
+        message = message.replace(str(config), "[rclone-config]")
+    return message[-1000:]
+
+
+def _run_rclone(arguments: list[str], timeout: int = RCLONE_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
+    config = rclone_config_path()
+    if not rclone_enabled() or config is None:
+        raise RuntimeError("Rclone is not ready. Check RCLONE_REMOTE, RCLONE_CONFIG, RCLONE_DATASET_ROOT, and the rclone binary.")
+
+    try:
+        return subprocess.run(
+            ["rclone", *arguments, "--config", str(config)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Rclone command timed out after {timeout} seconds.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Rclone command failed: {_safe_error(exc.stderr)}") from exc
+
+
+def build_remote_path(relative_path: str) -> str:
+    relative = PurePosixPath(relative_path.strip().lstrip("/"))
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("Invalid remote path.")
+    return f"{remote_dataset_root()}/{relative.as_posix()}"
+
+
+def validate_remote_path(remote_path: str) -> str:
+    allowed_prefix = f"{remote_dataset_root()}/"
+    if not remote_path.startswith(allowed_prefix):
+        raise ValueError("Remote path is outside the configured dataset root.")
+    relative = PurePosixPath(remote_path[len(allowed_prefix) :])
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("Invalid remote path.")
+    return remote_path
+
+
+def upload_file(path: Path, remote_relative_path: str, content_type: str = "application/octet-stream") -> str:
+    del content_type  # Kept for compatibility with the existing app call sites.
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Upload source does not exist: {source}")
+
+    remote_path = build_remote_path(remote_relative_path)
+    with tempfile.TemporaryDirectory(prefix="llie-rclone-upload-") as temp_dir:
+        temp_path = Path(temp_dir) / source.name
+        shutil.copy2(source, temp_path)
+        _run_rclone(["copyto", str(temp_path), remote_path])
+    return remote_path
+
+
+def download_file(remote_path: str) -> Path:
+    validated_path = validate_remote_path(remote_path)
+    suffix = Path(validated_path).suffix or ".bin"
+    handle = tempfile.NamedTemporaryFile(prefix="llie-rclone-read-", suffix=suffix, delete=False)
+    temp_path = Path(handle.name)
+    handle.close()
+    try:
+        _run_rclone(["copyto", validated_path, str(temp_path)])
+        return temp_path
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _pair_key(filename: str, suffixes: tuple[str, ...]) -> str:
+    stem = Path(filename).stem
+    for suffix in suffixes:
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def _list_remote_files(relative_path: str) -> list[str]:
+    try:
+        result = _run_rclone(["lsjson", build_remote_path(relative_path), "--recursive", "--files-only"], timeout=60)
+    except RuntimeError as exc:
+        if "directory not found" in str(exc).lower():
+            return []
+        raise
+    try:
+        items = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Rclone returned invalid JSON while counting dataset files.") from exc
+    return [
+        str(item["Path"])
+        for item in items
+        if not item.get("IsDir") and item.get("Path") and Path(str(item["Path"])).suffix.lower() in IMAGE_SUFFIXES
+    ]
+
+
+def dataset_stats() -> dict:
+    low_files = _list_remote_files("raw/low")
+    reference_files = _list_remote_files("raw/reference")
+    low_keys = {_pair_key(name, ("_low",)) for name in low_files}
+    reference_keys = {_pair_key(name, ("_reference", "_high")) for name in reference_files}
+    paired_keys = low_keys & reference_keys
     return {
-        "cloudinary_url_present": bool(os.environ.get("CLOUDINARY_URL")),
-        "cloud_name_present": bool(first_env("CLOUDINARY_CLOUD_NAME", "CLOUD_NAME", "CLOUDINARY_NAME")),
-        "cloud_name": first_env("CLOUDINARY_CLOUD_NAME", "CLOUD_NAME", "CLOUDINARY_NAME"),
-        "api_key_present": bool(api_key),
-        "api_key_last4": api_key[-4:] if api_key else None,
-        "api_secret_present": bool(first_env("CLOUDINARY_API_SECRET", "CLOUDINARY_SECRET", "CLOUDINARY_API_SECRET_KEY")),
-        "folder": storage_prefix(),
+        "pair_count": len(paired_keys),
+        "low_count": len(low_files),
+        "reference_count": len(reference_files),
+        "unmatched_low_count": len(low_keys - reference_keys),
+        "unmatched_reference_count": len(reference_keys - low_keys),
     }
 
 
-def storage_prefix() -> str:
-    return os.environ.get("CLOUDINARY_FOLDER", "lowlight_datasets").strip("/")
-
-
-def cleanup_after_save() -> bool:
-    value = os.environ.get("CLEANUP_AFTER_SAVE")
-    if value is None:
-        return cloudinary_enabled()
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-@lru_cache(maxsize=1)
-def configure_cloudinary():
-    if not cloudinary_enabled():
-        return False
-
-    import cloudinary
-
-    if os.environ.get("CLOUDINARY_URL"):
-        cloudinary.config(secure=True)
-    else:
-        cloudinary.config(
-            cloud_name=first_env("CLOUDINARY_CLOUD_NAME", "CLOUD_NAME", "CLOUDINARY_NAME"),
-            api_key=first_env("CLOUDINARY_API_KEY", "CLOUDINARY_KEY"),
-            api_secret=first_env("CLOUDINARY_API_SECRET", "CLOUDINARY_SECRET", "CLOUDINARY_API_SECRET_KEY"),
-            secure=True,
-        )
-    return True
-
-
-def public_id_from_key(key: str) -> str:
-    path = Path(key)
-    if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".csv", ".json", ".txt"}:
-        key = str(path.with_suffix(""))
-    return key.strip("/")
-
-
-def upload_file(path: Path, key: str, content_type: str = "application/octet-stream") -> str:
-    if not configure_cloudinary():
-        raise RuntimeError("Cloudinary is not configured.")
-
-    import cloudinary.uploader
-
-    is_image = content_type.startswith("image/")
-    result = cloudinary.uploader.upload(
-        str(path),
-        public_id=public_id_from_key(key),
-        resource_type="image" if is_image else "raw",
-        overwrite=True,
-        invalidate=True,
-    )
-    return result["secure_url"]
-
-
-def upload_bytes(payload: bytes, key: str, content_type: str = "application/octet-stream") -> str:
-    if not configure_cloudinary():
-        raise RuntimeError("Cloudinary is not configured.")
-
-    suffix = Path(key).suffix or ".bin"
-    with tempfile.NamedTemporaryFile(suffix=suffix) as handle:
-        handle.write(payload)
-        handle.flush()
-        return upload_file(Path(handle.name), key, content_type)
-
-
-def cloudinary_health() -> dict:
-    if not configure_cloudinary():
-        missing = missing_cloudinary_vars()
-        return {
-            "configured": False,
-            "ok": False,
-            "error": "Cloudinary env vars are missing.",
-            "missing": missing,
-            "env": cloudinary_env_diagnostics(),
-        }
+def rclone_health() -> dict:
+    missing = missing_rclone_settings()
+    config = rclone_config_path()
+    diagnostics = {
+        "remote": rclone_remote() or None,
+        "dataset_root": rclone_dataset_root() or None,
+        "config_present": bool(config and config.is_file()),
+        "binary_present": shutil.which("rclone") is not None,
+    }
+    if missing:
+        return {"configured": False, "ok": False, "error": "Rclone environment variables are missing.", "missing": missing, "env": diagnostics}
+    if not diagnostics["config_present"]:
+        return {"configured": True, "ok": False, "error": "Rclone config file does not exist.", "env": diagnostics}
+    if not diagnostics["binary_present"]:
+        return {"configured": True, "ok": False, "error": "Rclone binary is not installed or not on PATH.", "env": diagnostics}
 
     try:
-        import cloudinary.api
-
-        result = cloudinary.api.ping()
-        return {
-            "configured": True,
-            "ok": result.get("status") == "ok",
-            "status": result.get("status"),
-            "env": cloudinary_env_diagnostics(),
-        }
+        _run_rclone(["lsd", f"{rclone_remote()}:", "--max-depth", "1"], timeout=30)
+        return {"configured": True, "ok": True, "status": "ok", "env": diagnostics}
     except Exception as exc:
-        return {"configured": True, "ok": False, "error": str(exc), "env": cloudinary_env_diagnostics()}
+        return {"configured": True, "ok": False, "error": str(exc), "env": diagnostics}

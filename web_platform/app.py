@@ -5,14 +5,24 @@ import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import text
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
-from .pipeline import PipelineConfig, config_from_form, load_manifest, run_pipeline
+from .pipeline import PipelineConfig, config_from_form, load_manifest, match_image_groups, run_pipeline
 from .database import init_db, SessionLocal, Job as DBJob, PairCandidate as DBPair, ReviewedPair as DBReviewedPair
-from .storage import cleanup_after_save, cloudinary_enabled, cloudinary_health, storage_prefix, upload_file
+from .storage import (
+    dataset_stats,
+    download_file,
+    rclone_enabled,
+    rclone_health,
+    remote_dataset_root,
+    upload_file,
+)
 
 # Initialize database tables on startup
 DB_INIT_ERROR: str | None = None
@@ -26,14 +36,15 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "web_data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 JOB_DIR = DATA_DIR / "jobs"
-DATASET_DIR = DATA_DIR / "selected_dataset"
 
-for folder in [UPLOAD_DIR, JOB_DIR, DATASET_DIR]:
+for folder in [UPLOAD_DIR, JOB_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Low Light Pair Builder")
 executor = ThreadPoolExecutor(max_workers=1)
 jobs: dict[str, dict] = {}
+drive_upload_progress: dict[str, dict] = {}
+drive_upload_progress_lock = Lock()
 TEAM_OBJECTIVE_PAIRS = 500
 
 
@@ -455,6 +466,41 @@ INDEX_HTML = """<!doctype html>
       gap: 12px;
     }
 
+    .drive-progress {
+      display: grid;
+      gap: 8px;
+      width: 100%;
+    }
+
+    .drive-progress-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+
+    .drive-progress-row span:last-child {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      text-align: right;
+    }
+
+    .drive-progress-track {
+      height: 10px;
+      overflow: hidden;
+      border-radius: 5px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .drive-progress-bar {
+      width: var(--progress-percent, 0%);
+      height: 100%;
+      background: var(--accent-gradient);
+      transition: width 0.25s ease;
+    }
+
     .spinner {
       width: 18px;
       height: 18px;
@@ -516,7 +562,8 @@ INDEX_HTML = """<!doctype html>
       color: var(--text-secondary);
     }
 
-    .job-field input {
+    .job-field input:not([type="checkbox"]),
+    .job-field select {
       width: 100%;
       background: var(--input-bg);
       border: 1px solid var(--input-border);
@@ -527,9 +574,16 @@ INDEX_HTML = """<!doctype html>
       outline: none;
     }
 
-    .job-field input:focus {
+    .job-field input:not([type="checkbox"]):focus,
+    .job-field select:focus {
       border-color: var(--border-focus);
       box-shadow: 0 0 0 3px rgba(6, 182, 212, 0.12);
+    }
+
+    .job-option-note {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 500;
     }
 
     .objective-progress {
@@ -1105,7 +1159,7 @@ INDEX_HTML = """<!doctype html>
           </div>
           <div class="guide-card">
             <strong>Lưu trữ Dataset</strong>
-            Các cặp được chọn sẽ copy vào web_platform/web_data/selected_dataset kèm metadata và nhật ký chỉnh sửa.
+            Các cặp được chọn sẽ upload lên Google Drive qua rclone; metadata và remote path được lưu trong database.
           </div>
         </div>
       </div>
@@ -1129,7 +1183,7 @@ INDEX_HTML = """<!doctype html>
                 <input id="submittedByInput" name="submitted_by" type="text" maxlength="120" placeholder="VD: Nguyễn Văn A" required>
               </div>
               <div class="job-field">
-                <label for="objectivePairsInput">Mục tiêu team</label>
+                <label for="objectivePairsInput">Mục tiêu Google Drive</label>
                 <input id="objectivePairsInput" name="objective_pairs" type="number" min="1" step="1" value="500" readonly>
               </div>
             </div>
@@ -1139,22 +1193,31 @@ INDEX_HTML = """<!doctype html>
 
         <form id="imagePairForm">
           <div class="card" style="margin-bottom: 20px;">
-            <h2 class="card-title">Upload nhanh nhiều ảnh</h2>
+            <h2 class="card-title">2. Upload Cặp LOW / Reference Có Sẵn</h2>
             <div class="job-fields">
               <div class="job-field">
                 <label for="directSubmittedByInput">Người nộp</label>
                 <input id="directSubmittedByInput" name="submitted_by" type="text" maxlength="120" placeholder="VD: Nguyễn Văn A" required>
               </div>
               <div class="job-field">
-                <label for="directLowInput">Ảnh LOW</label>
+                <label for="directLowInput">Nhóm ảnh LOW</label>
                 <input id="directLowInput" name="low_images" type="file" accept="image/*" multiple required>
               </div>
               <div class="job-field">
-                <label for="directHighInput">Ảnh HIGH</label>
+                <label for="directHighInput">Nhóm ảnh Reference (HIGH)</label>
                 <input id="directHighInput" name="high_images" type="file" accept="image/*" multiple required>
+                <span class="job-option-note">Hệ thống sẽ chạy matching như pipeline video rồi đề xuất cặp để review.</span>
+              </div>
+              <div class="job-field">
+                <label for="directJobModeInput">Cách gán job_id / source group</label>
+                <select id="directJobModeInput" name="job_group_mode">
+                  <option value="shared" selected>Cả batch dùng chung một job_id</option>
+                  <option value="separate">Mỗi cặp dùng một job_id riêng</option>
+                </select>
+                <span class="job-option-note">Chọn job riêng khi mỗi cặp là một cảnh độc lập; chọn chung khi các cặp thuộc cùng một cảnh/video.</span>
               </div>
             </div>
-            <button id="imagePairBtn" type="submit" class="btn btn-submit">Xem trước batch ảnh</button>
+            <button id="imagePairBtn" type="submit" class="btn btn-submit">Xem trước và ghép cặp ảnh</button>
           </div>
         </form>
 
@@ -1288,7 +1351,7 @@ INDEX_HTML = """<!doctype html>
             <div class="objective-chart-card">
               <div class="pie-chart" style="--pie-deg: 0deg;" data-percent="0%"></div>
               <div class="objective-chart-copy">
-                <span class="objective-label">Mục tiêu team</span>
+                <span class="objective-label">Mục tiêu Google Drive</span>
                 <span class="objective-value">0/500 cặp</span>
                 <span class="objective-note">Còn thiếu 500 cặp ảnh</span>
               </div>
@@ -1335,7 +1398,7 @@ INDEX_HTML = """<!doctype html>
     let lowOptions = [];
     let highOptions = [];
     let currentJobMeta = { submitted_by: "", objective_pairs: null, saved_count: 0 };
-    let teamStats = { saved_count: 0, objective_pairs: 500, remaining_pairs: 500 };
+    let teamStats = { saved_count: 0, objective_pairs: 500, remaining_pairs: 500, low_count: 0, reference_count: 0 };
     let pendingDirectPair = null;
     let directLowFiles = [];
     let directHighFiles = [];
@@ -1357,6 +1420,7 @@ INDEX_HTML = """<!doctype html>
     const fileInfo = document.getElementById("fileInfo");
     const submittedByInput = document.getElementById("submittedByInput");
     const directSubmittedByInput = document.getElementById("directSubmittedByInput");
+    const directJobModeInput = document.getElementById("directJobModeInput");
     const objectivePairsInput = document.getElementById("objectivePairsInput");
     if (videoInput && fileInfo) {
       videoInput.addEventListener("change", (e) => {
@@ -1401,11 +1465,17 @@ INDEX_HTML = """<!doctype html>
       objectivePairsInput.addEventListener("input", syncJobMetaFromInputs);
     }
 
-    function clearPendingDirectBatch() {
+    function clearPendingDirectBatch(cleanupServer = true) {
       if (pendingDirectPair) {
-        [...(pendingDirectPair.lowOptions || []), ...(pendingDirectPair.highOptions || [])].forEach(item => {
-          if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
-        });
+        if (cleanupServer && pendingDirectPair.previewId) {
+          fetch(`/api/image-pairs/preview/${pendingDirectPair.previewId}`, { method: "DELETE" }).catch(() => {});
+        }
+        const previewUrls = new Set(
+          [...(pendingDirectPair.lowOptions || []), ...(pendingDirectPair.highOptions || [])]
+            .map(item => item.previewUrl)
+            .filter(Boolean)
+        );
+        previewUrls.forEach(url => URL.revokeObjectURL(url));
       }
       pendingDirectPair = null;
       directLowFiles = [];
@@ -1495,86 +1565,58 @@ INDEX_HTML = """<!doctype html>
 
     imagePairForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      clearPendingDirectBatch();
       directLowFiles = Array.from(document.getElementById("directLowInput").files || []);
       directHighFiles = Array.from(document.getElementById("directHighInput").files || []);
       if (!directLowFiles.length || !directHighFiles.length) return;
 
-      clearPendingDirectBatch();
-      directLowFiles = Array.from(document.getElementById("directLowInput").files || []);
-      directHighFiles = Array.from(document.getElementById("directHighInput").files || []);
-      const directLowOptions = directLowFiles.map((file, index) => ({
-        idx: index,
-        file_index: index,
-        name: file.name,
-        path: URL.createObjectURL(file),
-        previewUrl: null,
-        brightness: null,
-        direct_upload: true
-      }));
-      const directHighOptions = directHighFiles.map((file, index) => ({
-        idx: index,
-        file_index: index,
-        name: file.name,
-        path: URL.createObjectURL(file),
-        previewUrl: null,
-        brightness: null,
-        direct_upload: true
-      }));
-      directLowOptions.forEach(item => item.previewUrl = item.path);
-      directHighOptions.forEach(item => item.previewUrl = item.path);
-
-      pendingDirectPair = {
-        lowOptions: directLowOptions,
-        highOptions: directHighOptions
-      };
-      currentJobId = null;
-      lowOptions = directLowOptions;
-      highOptions = directHighOptions;
       currentJobMeta = {
         submitted_by: getDirectSubmitter(),
         objective_pairs: objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : null,
         saved_count: 0
       };
-      const initialPairCount = Math.min(directLowOptions.length, directHighOptions.length);
-      currentPairs = Array.from({ length: initialPairCount }, (_, index) => {
-        const low = directLowOptions[index];
-        const high = directHighOptions[index];
-        return {
-          pair_id: index,
-          segment_id: "direct",
-          mode: "direct_upload",
-          low_idx: low.idx,
-          high_idx: high.idx,
-          selected_high_idx: high.idx,
-          low_file_index: low.file_index,
-          high_file_index: high.file_index,
-          low_name: low.name,
-          high_name: high.name,
-          low_path: low.path,
-          high_path: high.path,
-          low_brightness: null,
-          high_brightness: null,
-          brightness_gap: null,
-          score: null,
-          good_matches: null,
-          inlier_ratio: null,
-          hog_hits: null,
-          accepted: true,
-          alternatives: []
-        };
-      });
-
       summaryEl.innerHTML = "";
-      renderPairs(currentPairs);
       renderObjectiveProgress();
-      saveBtn.disabled = false;
-      addPairBtn.disabled = lowOptions.length === 0 || highOptions.length === 0;
       statusEl.innerHTML = `
-        <span class="success-message">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
-          Đã tạo preview ${currentPairs.length} cặp từ ${directLowFiles.length} ảnh LOW và ${directHighFiles.length} ảnh HIGH. Các ảnh này sẽ được lưu chung một batch/video group khi bấm "Lưu cặp đã duyệt".
-        </span>
+        <div class="progress-container">
+          <div class="spinner"></div>
+          <span class="progress-text">Đang chạy matching ${directLowFiles.length} ảnh LOW với ${directHighFiles.length} ảnh reference...</span>
+        </div>
       `;
+      imagePairBtn.disabled = true;
+      saveBtn.disabled = true;
+      addPairBtn.disabled = true;
+
+      const body = new FormData(imagePairForm);
+      for (const [key] of Object.entries(defaultParams)) {
+        const input = document.querySelector(`[name="${key}"]`);
+        if (input) body.set(key, input.value);
+      }
+
+      try {
+        const response = await fetch("/api/image-pairs/preview", { method: "POST", body });
+        const payload = await parseJsonResponse(response);
+        currentJobId = payload.preview_id;
+        currentPairs = payload.pairs || [];
+        lowOptions = payload.low_options || [];
+        highOptions = payload.high_options || [];
+        pendingDirectPair = {
+          previewId: payload.preview_id,
+          lowOptions,
+          highOptions,
+          separateJobs: directJobModeInput ? directJobModeInput.value === "separate" : false
+        };
+        renderSummary(payload.summary || {});
+        renderPairs(currentPairs);
+        renderObjectiveProgress();
+        saveBtn.disabled = currentPairs.length === 0;
+        addPairBtn.disabled = lowOptions.length === 0 || highOptions.length === 0;
+        statusEl.innerHTML = `<span class="success-message">Matching hoàn tất: đề xuất ${currentPairs.length} cặp. Hãy review LOW/reference trước khi lưu.</span>`;
+      } catch (err) {
+        statusEl.innerHTML = `<span class="error-message">Lỗi matching batch ảnh: ${err.message}</span>`;
+      } finally {
+        imagePairBtn.disabled = false;
+      }
     });
 
     async function pollJob() {
@@ -1641,6 +1683,8 @@ INDEX_HTML = """<!doctype html>
       const teamTarget = Number(teamStats.objective_pairs || 500);
       const teamSaved = Number(teamStats.saved_count || 0);
       const teamRemaining = Math.max(teamTarget - teamSaved, 0);
+      const driveLowCount = Number(teamStats.low_count || 0);
+      const driveReferenceCount = Number(teamStats.reference_count || 0);
       const percent = teamTarget > 0 ? Math.min(Math.round((teamSaved / teamTarget) * 100), 100) : 0;
       const pieDeg = Math.min((teamSaved / Math.max(teamTarget, 1)) * 360, 360).toFixed(1);
       const saved = savedOverride === null ? Number(currentJobMeta.saved_count || 0) : Number(savedOverride || 0);
@@ -1651,9 +1695,9 @@ INDEX_HTML = """<!doctype html>
         <div class="objective-chart-card ${doneClass}">
           <div class="pie-chart" style="--pie-deg: ${pieDeg}deg;" data-percent="${percent}%"></div>
           <div class="objective-chart-copy">
-            <span class="objective-label">Mục tiêu team</span>
+            <span class="objective-label">Mục tiêu Google Drive</span>
             <span class="objective-value">${teamSaved}/${teamTarget} cặp</span>
-            <span class="objective-note">${teamRemaining === 0 ? "Đã đạt mục tiêu 500 cặp" : `Còn thiếu ${teamRemaining} cặp ảnh`}</span>
+            <span class="objective-note">Drive: ${driveLowCount} LOW / ${driveReferenceCount} reference. ${teamRemaining === 0 ? "Đã đạt mục tiêu" : `Còn thiếu ${teamRemaining} cặp`}</span>
           </div>
         </div>
         <div class="objective-pill">
@@ -1684,7 +1728,9 @@ INDEX_HTML = """<!doctype html>
         teamStats = {
           saved_count: Number(stats.saved_count || 0),
           objective_pairs: Number(stats.objective_pairs || 500),
-          remaining_pairs: Number(stats.remaining_pairs || 0)
+          remaining_pairs: Number(stats.remaining_pairs || 0),
+          low_count: Number(stats.low_count || 0),
+          reference_count: Number(stats.reference_count || 0)
         };
         renderObjectiveProgress();
       } catch (err) {
@@ -1693,6 +1739,64 @@ INDEX_HTML = """<!doctype html>
     }
 
     fetchTeamStats();
+
+    function createProgressId() {
+      return window.crypto && window.crypto.randomUUID
+        ? window.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
+    function renderDriveUploadProgress(progress, fallbackPairs) {
+      const totalFiles = Number(progress.total_files || Math.max(fallbackPairs * 2, 1));
+      const completedFiles = Math.min(Number(progress.completed_files || 0), totalFiles);
+      const totalPairs = Number(progress.total_pairs || fallbackPairs || 0);
+      const completedPairs = Math.min(Number(progress.completed_pairs || Math.floor(completedFiles / 2)), totalPairs);
+      const percent = Math.min(Math.round((completedFiles / Math.max(totalFiles, 1)) * 100), 100);
+      const label = progress.status === "processing"
+        ? "Đã upload xong, đang lưu metadata..."
+        : `Đang upload lên Google Drive: ${completedPairs}/${totalPairs} cặp`;
+      statusEl.innerHTML = `
+        <div class="drive-progress">
+          <div class="drive-progress-row">
+            <span>${label}</span>
+            <strong>${percent}%</strong>
+          </div>
+          <div class="drive-progress-track">
+            <div class="drive-progress-bar" style="--progress-percent: ${percent}%"></div>
+          </div>
+          <div class="drive-progress-row">
+            <span>${completedFiles}/${totalFiles} file</span>
+            <span>${progress.current_file || "Đang chuẩn bị..."}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    function startDriveProgressPolling(progressId, totalPairs) {
+      let stopped = false;
+      let timer = null;
+      renderDriveUploadProgress({ status: "uploading", completed_files: 0, total_files: totalPairs * 2, total_pairs: totalPairs }, totalPairs);
+
+      const poll = async () => {
+        if (stopped) return;
+        try {
+          const response = await fetch(`/api/upload-progress/${encodeURIComponent(progressId)}`);
+          if (response.ok) {
+            const progress = await response.json();
+            renderDriveUploadProgress(progress, totalPairs);
+            if (progress.status === "complete" || progress.status === "error") return;
+          }
+        } catch (err) {
+          // The save request still provides the final success/error state.
+        }
+        timer = setTimeout(poll, 500);
+      };
+      timer = setTimeout(poll, 250);
+      return () => {
+        stopped = true;
+        if (timer) clearTimeout(timer);
+      };
+    }
 
     async function parseJsonResponse(response) {
       const text = await response.text();
@@ -1737,6 +1841,9 @@ INDEX_HTML = """<!doctype html>
       if (!path) return "";
       if (path.startsWith("blob:") || path.startsWith("data:") || path.startsWith("http://") || path.startsWith("https://")) {
         return path;
+      }
+      if (/^[A-Za-z0-9_-]+:/.test(path)) {
+        return `/api/storage/file?path=${encodeURIComponent(path)}`;
       }
       return `/api/jobs/${currentJobId}/frame?path=${encodeURIComponent(path)}`;
     }
@@ -1793,7 +1900,7 @@ INDEX_HTML = """<!doctype html>
                   <select class="alt-select">${highSelectOptions}</select>
                 </label>
                 <button type="button" class="reject-btn">Loại Cặp này</button>
-                <div class="direct-note">Batch upload trực tiếp: các cặp lưu trong lần này dùng chung một job/video group để tránh leakage khi chia train/val/test.</div>
+                <div class="direct-note">Batch upload trực tiếp: ${pendingDirectPair && pendingDirectPair.separateJobs ? "mỗi cặp được lưu thành một job/source group riêng để phân biệt từng cảnh." : "các cặp lưu trong lần này dùng chung một job/video group để tránh leakage khi chia train/val/test."}</div>
         ` : `
                 <label>Thay đổi Frame LOW
                   <select class="low-select">${lowSelectOptions}</select>
@@ -1894,6 +2001,7 @@ INDEX_HTML = """<!doctype html>
       if (!lowOptions.length || !highOptions.length) return;
       const low = lowOptions[0];
       const high = highOptions[0];
+      if (!high) return;
       const nextId = currentPairs.length ? Math.max(...currentPairs.map(item => item.pair_id)) + 1 : 0;
       currentPairs.push({
         pair_id: nextId,
@@ -1942,28 +2050,24 @@ INDEX_HTML = """<!doctype html>
         statusEl.innerHTML = `<span class="error-message">Tất cả cặp ảnh đang bị bỏ chọn nên chưa lưu. Chọn lại ảnh nếu muốn upload.</span>`;
         return;
       }
-
       saveBtn.disabled = true;
       imagePairBtn.disabled = true;
-      statusEl.innerHTML = `
-        <div class="progress-container">
-          <div class="spinner"></div>
-          <span class="progress-text">Đang upload ${acceptedCount} cặp ảnh trực tiếp lên Cloudinary và lưu metadata...</span>
-        </div>
-      `;
+      const progressId = createProgressId();
+      const stopProgressPolling = startDriveProgressPolling(progressId, acceptedCount);
 
       const body = new FormData();
-      directLowFiles.forEach(file => body.append("low_images", file));
-      directHighFiles.forEach(file => body.append("high_images", file));
+      body.set("preview_id", pendingDirectPair.previewId);
+      body.set("progress_id", progressId);
       body.set("pairs_json", JSON.stringify(reviewed));
       body.set("submitted_by", getDirectSubmitter());
       body.set("objective_pairs", objectivePairsInput && objectivePairsInput.value ? objectivePairsInput.value : 500);
+      body.set("separate_jobs", pendingDirectPair.separateJobs ? "1" : "0");
 
       try {
         const response = await fetch("/api/image-pairs", { method: "POST", body });
         const payload = await parseJsonResponse(response);
 
-        currentJobId = payload.job_id;
+        currentJobId = (payload.job_ids && payload.job_ids[0]) || payload.job_id;
         currentJobMeta = {
           submitted_by: payload.submitted_by || getDirectSubmitter(),
           objective_pairs: payload.objective_pairs || (objectivePairsInput && objectivePairsInput.value ? Number(objectivePairsInput.value) : 500),
@@ -1972,9 +2076,11 @@ INDEX_HTML = """<!doctype html>
         teamStats = {
           saved_count: Number(payload.team_saved_count || 0),
           objective_pairs: Number(payload.team_objective_pairs || 500),
-          remaining_pairs: Number(payload.team_remaining_pairs || 0)
+          remaining_pairs: Number(payload.team_remaining_pairs || 0),
+          low_count: Number(payload.team_low_count || 0),
+          reference_count: Number(payload.team_reference_count || 0)
         };
-        clearPendingDirectBatch();
+        clearPendingDirectBatch(false);
         currentPairs = [];
         renderPairs(currentPairs);
         renderObjectiveProgress(currentJobMeta.saved_count);
@@ -1983,13 +2089,14 @@ INDEX_HTML = """<!doctype html>
         statusEl.innerHTML = `
           <span class="success-message">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
-            Đã lưu thành công ${payload.copied} cặp ảnh trực tiếp trong cùng batch ${payload.job_id}. Tiến độ team: ${payload.team_saved_count}/${payload.team_objective_pairs}.
+            Đã lưu thành công ${payload.copied} cặp ảnh trực tiếp ${payload.separate_jobs ? `thành ${payload.job_ids ? payload.job_ids.length : 1} job riêng` : `trong cùng batch ${payload.job_id}`}. Tiến độ team: ${payload.team_saved_count}/${payload.team_objective_pairs}.
           </span>
         `;
       } catch (err) {
         saveBtn.disabled = false;
         statusEl.innerHTML = `<span class="error-message">Lỗi khi lưu cặp ảnh trực tiếp: ${err.message}</span>`;
       } finally {
+        stopProgressPolling();
         imagePairBtn.disabled = false;
       }
     }
@@ -2010,19 +2117,16 @@ INDEX_HTML = """<!doctype html>
         };
       });
 
+      const acceptedCount = reviewed.filter(item => item.accepted).length;
+      const progressId = createProgressId();
       saveBtn.disabled = true;
-      statusEl.innerHTML = `
-        <div class="progress-container">
-          <div class="spinner"></div>
-          <span class="progress-text">Đang lưu cặp ảnh và sao chép tệp...</span>
-        </div>
-      `;
+      const stopProgressPolling = startDriveProgressPolling(progressId, acceptedCount);
 
       try {
         const response = await fetch(`/api/jobs/${currentJobId}/save`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pairs: reviewed })
+          body: JSON.stringify({ pairs: reviewed, progress_id: progressId })
         });
         const payload = await parseJsonResponse(response);
         currentJobMeta.saved_count = payload.saved_count || payload.copied || 0;
@@ -2033,7 +2137,9 @@ INDEX_HTML = """<!doctype html>
           teamStats = {
             saved_count: Number(payload.team_saved_count || 0),
             objective_pairs: Number(payload.team_objective_pairs || 500),
-            remaining_pairs: Number(payload.team_remaining_pairs || 0)
+            remaining_pairs: Number(payload.team_remaining_pairs || 0),
+            low_count: Number(payload.team_low_count || 0),
+            reference_count: Number(payload.team_reference_count || 0)
           };
         }
         const remainingText = payload.team_objective_pairs ? ` Tiến độ team: ${payload.team_saved_count}/${payload.team_objective_pairs}, còn thiếu ${payload.team_remaining_pairs} cặp.` : "";
@@ -2045,6 +2151,8 @@ INDEX_HTML = """<!doctype html>
         `;
       } catch (err) {
         statusEl.innerHTML = `<span class="error-message">Lỗi khi lưu cặp ảnh: ${err.message}</span>`;
+      } finally {
+        stopProgressPolling();
       }
       saveBtn.disabled = false;
     });
@@ -2154,16 +2262,40 @@ def index():
 
 @app.get("/api/stats")
 def get_stats():
-    db = SessionLocal()
     try:
-        saved_count = db.query(DBReviewedPair).count()
-    finally:
-        db.close()
+        drive_stats = dataset_stats()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Không đọc được tiến độ từ Google Drive: {exc}") from exc
+    saved_count = drive_stats["pair_count"]
     return {
         "objective_pairs": TEAM_OBJECTIVE_PAIRS,
         "saved_count": saved_count,
         "remaining_pairs": max(TEAM_OBJECTIVE_PAIRS - saved_count, 0),
+        "low_count": drive_stats["low_count"],
+        "reference_count": drive_stats["reference_count"],
+        "unmatched_low_count": drive_stats["unmatched_low_count"],
+        "unmatched_reference_count": drive_stats["unmatched_reference_count"],
+        "source": "google_drive",
     }
+
+
+def update_drive_upload_progress(progress_id: str | None, **values) -> None:
+    if not progress_id:
+        return
+    with drive_upload_progress_lock:
+        if progress_id not in drive_upload_progress and len(drive_upload_progress) >= 200:
+            drive_upload_progress.pop(next(iter(drive_upload_progress)))
+        current = drive_upload_progress.setdefault(progress_id, {})
+        current.update(values)
+
+
+@app.get("/api/upload-progress/{progress_id}")
+def get_upload_progress(progress_id: str):
+    with drive_upload_progress_lock:
+        progress = drive_upload_progress.get(progress_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy tiến độ upload.")
+        return dict(progress)
 
 
 @app.get("/api/health")
@@ -2186,26 +2318,25 @@ def health_check():
             "error": db_error,
             "init_error": DB_INIT_ERROR,
         },
-        "cloudinary": cloudinary_health(),
+        "rclone": rclone_health(),
         "team_objective_pairs": TEAM_OBJECTIVE_PAIRS,
     }
 
 
-def save_reviewed_outputs(job_id: str, reviewed_pairs: list[dict], start_idx: int) -> tuple[int, list[dict], str]:
+def save_reviewed_outputs(
+    job_id: str,
+    reviewed_pairs: list[dict],
+    start_idx: int,
+    progress_id: str | None = None,
+    progress_offset: int = 0,
+    progress_total: int | None = None,
+) -> tuple[int, list[dict], str]:
     rows: list[dict] = []
     copied = 0
-    use_cloudinary = cloudinary_enabled()
+    if not rclone_enabled():
+        raise RuntimeError("Rclone is not ready. Configure rclone before saving reviewed pairs.")
 
-    if use_cloudinary:
-        prefix = f"{storage_prefix()}/{job_id}"
-        storage_mode = "cloudinary"
-    else:
-        low_dir = DATASET_DIR / "low"
-        high_dir = DATASET_DIR / "high"
-        for folder in [low_dir, high_dir]:
-            folder.mkdir(parents=True, exist_ok=True)
-        prefix = ""
-        storage_mode = "local"
+    storage_mode = "rclone"
 
     for item in reviewed_pairs:
         if not item.get("accepted", True):
@@ -2217,20 +2348,27 @@ def save_reviewed_outputs(job_id: str, reviewed_pairs: list[dict], start_idx: in
 
         dst_idx = start_idx + copied
         low_name = f"pair_{dst_idx:06d}_low.png"
-        high_name = f"pair_{dst_idx:06d}_high.png"
+        reference_name = f"pair_{dst_idx:06d}_reference.png"
 
-        if use_cloudinary:
-            low_key = f"{prefix}/low/{low_name}"
-            high_key = f"{prefix}/high/{high_name}"
-            saved_low = upload_file(low_path, low_key, "image/png")
-            saved_high = upload_file(high_path, high_key, "image/png")
-        else:
-            dst_low = low_dir / low_name
-            dst_high = high_dir / high_name
-            shutil.copy2(low_path, dst_low)
-            shutil.copy2(high_path, dst_high)
-            saved_low = str(dst_low)
-            saved_high = str(dst_high)
+        low_key = f"raw/low/{low_name}"
+        high_key = f"raw/reference/{reference_name}"
+        saved_low = upload_file(low_path, low_key, "image/png")
+        update_drive_upload_progress(
+            progress_id,
+            status="uploading",
+            completed_files=progress_offset + copied * 2 + 1,
+            total_files=progress_total,
+            current_file=low_name,
+        )
+        saved_high = upload_file(high_path, high_key, "image/png")
+        update_drive_upload_progress(
+            progress_id,
+            status="uploading",
+            completed_files=progress_offset + copied * 2 + 2,
+            completed_pairs=(progress_offset + copied * 2 + 2) // 2,
+            total_files=progress_total,
+            current_file=reference_name,
+        )
 
         rows.append(
             {
@@ -2286,53 +2424,116 @@ def safe_float(value, fallback: float | None = None) -> float | None:
         return fallback
 
 
+def image_suffix(filename: str | None) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    return suffix if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} else ".png"
+
+
+def valid_preview_dir(preview_id: str) -> Path | None:
+    if len(preview_id) != 12 or any(character not in "0123456789abcdef" for character in preview_id.lower()):
+        return None
+    preview_dir = (JOB_DIR / preview_id).resolve()
+    return preview_dir if preview_dir.parent == JOB_DIR.resolve() and preview_dir.is_dir() else None
+
+
+@app.post("/api/image-pairs/preview")
+async def preview_image_pairs(request: Request):
+    form = await request.form()
+    low_images = [item for item in form.getlist("low_images") if hasattr(item, "file")]
+    high_images = [item for item in form.getlist("high_images") if hasattr(item, "file")]
+    if not low_images or not high_images:
+        raise HTTPException(status_code=400, detail="Cần upload ít nhất 1 ảnh LOW và 1 ảnh reference.")
+
+    preview_id = uuid.uuid4().hex[:12]
+    direct_dir = JOB_DIR / preview_id / "direct_pair"
+    low_dir = direct_dir / "low"
+    high_dir = direct_dir / "high"
+    low_dir.mkdir(parents=True, exist_ok=True)
+    high_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        low_paths = []
+        high_paths = []
+        for idx, image in enumerate(low_images):
+            path = low_dir / f"low_{idx:04d}{image_suffix(image.filename)}"
+            with path.open("wb") as handle:
+                shutil.copyfileobj(image.file, handle)
+            low_paths.append(path)
+        for idx, image in enumerate(high_images):
+            path = high_dir / f"reference_{idx:04d}{image_suffix(image.filename)}"
+            with path.open("wb") as handle:
+                shutil.copyfileobj(image.file, handle)
+            high_paths.append(path)
+
+        result = match_image_groups(low_paths, high_paths, config_from_form(dict(form)))
+        return {"preview_id": preview_id, **result}
+    except Exception as exc:
+        cleanup_job_files(preview_id)
+        raise HTTPException(status_code=500, detail=f"Lỗi matching ảnh LOW/reference: {exc}") from exc
+
+
+@app.delete("/api/image-pairs/preview/{preview_id}")
+def delete_image_pair_preview(preview_id: str):
+    preview_dir = valid_preview_dir(preview_id)
+    if preview_dir is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy preview batch ảnh.")
+    cleanup_job_files(preview_id)
+    return {"deleted": True}
+
+
 @app.post("/api/image-pairs")
 async def create_image_pair(request: Request):
     form = await request.form()
     submitted_by = str(form.get("submitted_by") or "").strip() or "Không rõ"
     objective_pairs = parse_objective(form.get("objective_pairs"))
-    job_id = uuid.uuid4().hex[:12]
+    separate_jobs = str(form.get("separate_jobs") or "").lower() in {"1", "true", "yes", "on"}
+    progress_id = str(form.get("progress_id") or "").strip()[:80] or None
+    preview_id = str(form.get("preview_id") or "").strip().lower()
+    preview_dir = valid_preview_dir(preview_id) if preview_id else None
+    if preview_id and preview_dir is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy preview batch ảnh.")
+    job_id = preview_id or uuid.uuid4().hex[:12]
     direct_dir = JOB_DIR / job_id / "direct_pair"
     direct_dir.mkdir(parents=True, exist_ok=True)
-    low_dir = direct_dir / "low"
-    high_dir = direct_dir / "high"
-    low_dir.mkdir(parents=True, exist_ok=True)
-    high_dir.mkdir(parents=True, exist_ok=True)
 
-    def image_suffix(filename: str | None) -> str:
-        suffix = Path(filename or "").suffix.lower()
-        return suffix if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} else ".png"
+    if preview_dir:
+        low_paths = sorted((direct_dir / "low").glob("*"))
+        high_paths = sorted((direct_dir / "high").glob("*"))
+    else:
+        low_images = list(form.getlist("low_images"))
+        high_images = list(form.getlist("high_images"))
+        # Backward compatibility with the older one-low/one-high form names.
+        if not low_images and form.get("low_image") is not None:
+            low_images = [form.get("low_image")]
+        if not high_images and form.get("high_image") is not None:
+            high_images = [form.get("high_image")]
+        low_images = [item for item in low_images if hasattr(item, "file")]
+        high_images = [item for item in high_images if hasattr(item, "file")]
+        if not low_images or not high_images:
+            raise HTTPException(status_code=400, detail="Cần upload hai nhóm ảnh LOW/reference.")
 
-    low_images = list(form.getlist("low_images"))
-    high_images = list(form.getlist("high_images"))
-    # Backward compatibility with the older one-low/one-high form names.
-    if not low_images and form.get("low_image") is not None:
-        low_images = [form.get("low_image")]
-    if not high_images and form.get("high_image") is not None:
-        high_images = [form.get("high_image")]
-    low_images = [item for item in low_images if hasattr(item, "file")]
-    high_images = [item for item in high_images if hasattr(item, "file")]
-    if not low_images or not high_images:
-        raise HTTPException(status_code=400, detail="Cần upload ít nhất 1 ảnh LOW và 1 ảnh HIGH.")
-
-    low_paths: list[Path] = []
-    high_paths: list[Path] = []
-    for idx, image in enumerate(low_images):
-        path = low_dir / f"low_{idx:04d}{image_suffix(image.filename)}"
-        with path.open("wb") as handle:
-            shutil.copyfileobj(image.file, handle)
-        low_paths.append(path)
-    for idx, image in enumerate(high_images):
-        path = high_dir / f"high_{idx:04d}{image_suffix(image.filename)}"
-        with path.open("wb") as handle:
-            shutil.copyfileobj(image.file, handle)
-        high_paths.append(path)
+        low_dir = direct_dir / "low"
+        high_dir = direct_dir / "high"
+        low_dir.mkdir(parents=True, exist_ok=True)
+        high_dir.mkdir(parents=True, exist_ok=True)
+        low_paths = []
+        high_paths = []
+        for idx, image in enumerate(low_images):
+            path = low_dir / f"low_{idx:04d}{image_suffix(image.filename)}"
+            with path.open("wb") as handle:
+                shutil.copyfileobj(image.file, handle)
+            low_paths.append(path)
+        for idx, image in enumerate(high_images):
+            path = high_dir / f"high_{idx:04d}{image_suffix(image.filename)}"
+            with path.open("wb") as handle:
+                shutil.copyfileobj(image.file, handle)
+            high_paths.append(path)
 
     pairs_raw = str(form.get("pairs_json") or "").strip()
     if pairs_raw:
         try:
             submitted_pairs = json.loads(pairs_raw)
         except json.JSONDecodeError as exc:
+            cleanup_job_files(job_id)
             raise HTTPException(status_code=400, detail="pairs_json không hợp lệ.") from exc
     else:
         submitted_pairs = [
@@ -2371,7 +2572,14 @@ async def create_image_pair(request: Request):
                 "human_decision": decision,
                 "low_path": str(low_path),
                 "high_path": str(high_path),
-                "score": None,
+                "low_brightness": safe_float(item.get("low_brightness")),
+                "high_brightness": safe_float(item.get("high_brightness")),
+                "brightness_gap": safe_float(item.get("brightness_gap")),
+                "score": safe_float(item.get("score")),
+                "good_matches": safe_int(item.get("good_matches")),
+                "inlier_ratio": safe_float(item.get("inlier_ratio")),
+                "hog_hits": safe_int(item.get("hog_hits")),
+                "alternatives": item.get("alternatives") or [],
             }
         )
         db_pair_rows.append(
@@ -2382,26 +2590,20 @@ async def create_image_pair(request: Request):
                 "low_path": str(low_path),
                 "high_path": str(high_path),
                 "accepted": accepted,
+                "low_brightness": safe_float(item.get("low_brightness")),
+                "high_brightness": safe_float(item.get("high_brightness")),
+                "brightness_gap": safe_float(item.get("brightness_gap")),
+                "score": safe_float(item.get("score")),
+                "good_matches": safe_int(item.get("good_matches")),
+                "inlier_ratio": safe_float(item.get("inlier_ratio")),
+                "hog_hits": safe_int(item.get("hog_hits")),
+                "alternatives": item.get("alternatives") or [],
             }
         )
 
     if not reviewed_pairs:
+        cleanup_job_files(job_id)
         raise HTTPException(status_code=400, detail="Không có cặp ảnh hợp lệ để lưu.")
-
-    jobs[job_id] = {
-        "status": "done",
-        "message": "Đã lưu batch ảnh trực tiếp",
-        "pairs": [],
-        "summary": {
-            "mode": "direct_image_batch",
-            "low_images": len(low_paths),
-            "high_images": len(high_paths),
-            "submitted_pairs": len(reviewed_pairs),
-        },
-        "submitted_by": submitted_by,
-        "objective_pairs": objective_pairs,
-        "saved_count": 0,
-    }
 
     db = SessionLocal()
     try:
@@ -2409,89 +2611,341 @@ async def create_image_pair(request: Request):
     finally:
         db.close()
 
-    try:
-        copied, saved_records, storage_mode = save_reviewed_outputs(job_id, reviewed_pairs, start_idx)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Lỗi upload/lưu file ảnh trực tiếp: {exc}") from exc
-    if not saved_records:
-        raise HTTPException(status_code=400, detail="Không lưu được cặp ảnh. Kiểm tra định dạng file ảnh.")
-    saved_by_source_pair = {record["source_pair_id"]: record for record in saved_records}
+    accepted_pairs = [item for item in reviewed_pairs if item.get("accepted", True)]
+    if not accepted_pairs:
+        cleanup_job_files(job_id)
+        raise HTTPException(status_code=400, detail="Không có cặp ảnh được chọn để lưu.")
+    upload_mode = "matched_groups" if preview_id else "split_groups"
+    progress_total = len(accepted_pairs) * 2
+    update_drive_upload_progress(
+        progress_id,
+        status="uploading",
+        completed_files=0,
+        completed_pairs=0,
+        total_files=progress_total,
+        total_pairs=len(accepted_pairs),
+        current_file=None,
+    )
 
-    db = SessionLocal()
-    try:
-        db_job = DBJob(
-            job_id=job_id,
-            status="done",
-            message="Đã lưu batch ảnh trực tiếp",
-            video_name=f"direct_image_batch_{job_id}",
-            submitted_by=submitted_by,
-            objective_pairs=objective_pairs,
-            summary_json=json.dumps({
+    if not separate_jobs:
+        jobs[job_id] = {
+            "status": "done",
+            "message": "Đã lưu batch ảnh trực tiếp",
+            "pairs": [],
+            "summary": {
                 "mode": "direct_image_batch",
+                "upload_mode": upload_mode,
                 "low_images": len(low_paths),
                 "high_images": len(high_paths),
                 "submitted_pairs": len(reviewed_pairs),
-            }),
+            },
+            "submitted_by": submitted_by,
+            "objective_pairs": objective_pairs,
+            "saved_count": 0,
+        }
+
+        try:
+            copied, saved_records, storage_mode = await run_in_threadpool(
+                save_reviewed_outputs,
+                job_id,
+                reviewed_pairs,
+                start_idx,
+                progress_id,
+                0,
+                progress_total,
+            )
+        except Exception as exc:
+            update_drive_upload_progress(progress_id, status="error", error=str(exc))
+            raise HTTPException(status_code=500, detail=f"Lỗi upload/lưu file ảnh trực tiếp: {exc}") from exc
+        if not saved_records:
+            raise HTTPException(status_code=400, detail="Không lưu được cặp ảnh. Kiểm tra định dạng file ảnh.")
+        saved_by_source_pair = {record["source_pair_id"]: record for record in saved_records}
+
+        db = SessionLocal()
+        try:
+            db_job = DBJob(
+                job_id=job_id,
+                status="done",
+                message="Đã lưu batch ảnh trực tiếp",
+                video_name=f"direct_image_batch_{job_id}",
+                submitted_by=submitted_by,
+                objective_pairs=objective_pairs,
+                summary_json=json.dumps({
+                    "mode": "direct_image_batch",
+                    "upload_mode": upload_mode,
+                    "low_images": len(low_paths),
+                    "high_images": len(high_paths),
+                    "submitted_pairs": len(reviewed_pairs),
+                }),
+            )
+            db.add(db_job)
+            for row in db_pair_rows:
+                db.add(
+                    DBPair(
+                        job_id=job_id,
+                        pair_id=row["pair_id"],
+                        segment_id="direct",
+                        low_idx=row["low_index"],
+                        high_idx=row["high_index"],
+                        selected_high_idx=row["high_index"],
+                        low_path=row["low_path"],
+                        high_path=row["high_path"],
+                        low_brightness=row["low_brightness"],
+                        high_brightness=row["high_brightness"],
+                        brightness_gap=row["brightness_gap"],
+                        score=row["score"],
+                        good_matches=row["good_matches"],
+                        inlier_ratio=row["inlier_ratio"],
+                        hog_hits=row["hog_hits"],
+                        accepted=row["accepted"],
+                        alternatives_json=json.dumps(row["alternatives"]),
+                    )
+                )
+            for item in reviewed_pairs:
+                saved_record = saved_by_source_pair.get(item["pair_id"])
+                if not saved_record:
+                    continue
+                db.add(
+                    DBReviewedPair(
+                        dataset_pair_id=saved_record["pair_id"],
+                        job_id=job_id,
+                        submitted_by=submitted_by,
+                        source_pair_id=item["pair_id"],
+                        low_path=item["low_path"],
+                        high_path=item["high_path"],
+                        saved_low=saved_record["saved_low"],
+                        saved_high=saved_record["saved_high"],
+                        score=item.get("score"),
+                        human_decision=item.get("human_decision", "accepted_direct")[:20],
+                    )
+                )
+            db.commit()
+            saved_count = db.query(DBReviewedPair).filter(DBReviewedPair.job_id == job_id).count()
+        except Exception as exc:
+            db.rollback()
+            update_drive_upload_progress(progress_id, status="error", error=str(exc))
+            raise HTTPException(status_code=500, detail=f"Lỗi lưu metadata cặp ảnh: {exc}") from exc
+        finally:
+            db.close()
+
+        update_drive_upload_progress(progress_id, status="processing", completed_files=progress_total)
+        drive_stats = await run_in_threadpool(dataset_stats)
+        team_saved_count = drive_stats["pair_count"]
+        jobs[job_id]["saved_count"] = saved_count
+        if storage_mode == "rclone":
+            cleanup_job_files(job_id)
+        update_drive_upload_progress(
+            progress_id,
+            status="complete",
+            completed_files=progress_total,
+            completed_pairs=len(accepted_pairs),
         )
-        db.add(db_job)
-        for row in db_pair_rows:
+
+        return {
+            "job_id": job_id,
+            "job_ids": [job_id],
+            "separate_jobs": False,
+            "copied": copied,
+            "storage": storage_mode,
+            "dataset_dir": remote_dataset_root(),
+            "submitted_by": submitted_by,
+            "objective_pairs": objective_pairs,
+            "saved_count": saved_count,
+            "team_objective_pairs": TEAM_OBJECTIVE_PAIRS,
+            "team_saved_count": team_saved_count,
+            "team_remaining_pairs": max(TEAM_OBJECTIVE_PAIRS - team_saved_count, 0),
+            "team_low_count": drive_stats["low_count"],
+            "team_reference_count": drive_stats["reference_count"],
+            "source_group": f"direct_image_batch_{job_id}",
+            "source_groups": [f"direct_image_batch_{job_id}"],
+            "saved_pairs": saved_records,
+        }
+
+    copied = 0
+    saved_records: list[dict] = []
+    storage_mode = "rclone" if rclone_enabled() else "unavailable"
+    pair_job_items: list[tuple[str, dict, dict | None, dict]] = []
+
+    try:
+        for item in accepted_pairs:
+            pair_job_id = uuid.uuid4().hex[:12]
+            pair_direct_dir = JOB_DIR / pair_job_id / "direct_pair"
+            pair_low_dir = pair_direct_dir / "low"
+            pair_high_dir = pair_direct_dir / "high"
+            pair_low_dir.mkdir(parents=True, exist_ok=True)
+            pair_high_dir.mkdir(parents=True, exist_ok=True)
+
+            original_low_path = Path(item["low_path"])
+            original_high_path = Path(item["high_path"])
+            pair_low_path = pair_low_dir / f"low_{item['pair_id']:04d}{original_low_path.suffix or '.png'}"
+            pair_high_path = pair_high_dir / f"high_{item['pair_id']:04d}{original_high_path.suffix or '.png'}"
+            shutil.copy2(original_low_path, pair_low_path)
+            shutil.copy2(original_high_path, pair_high_path)
+
+            item["job_id"] = pair_job_id
+            item["low_path"] = str(pair_low_path)
+            item["high_path"] = str(pair_high_path)
+            item_records_count, item_records, storage_mode = await run_in_threadpool(
+                save_reviewed_outputs,
+                pair_job_id,
+                [item],
+                start_idx + copied,
+                progress_id,
+                copied * 2,
+                progress_total,
+            )
+            if not item_records:
+                continue
+            copied += item_records_count
+            saved_record = item_records[0]
+            saved_records.append(saved_record)
+            row = next((entry for entry in db_pair_rows if entry["pair_id"] == item["pair_id"]), None)
+            if row:
+                row = {**row, "low_path": str(pair_low_path), "high_path": str(pair_high_path)}
+            pair_job_items.append((pair_job_id, item, row, saved_record))
+    except Exception as exc:
+        update_drive_upload_progress(progress_id, status="error", error=str(exc))
+        raise HTTPException(status_code=500, detail=f"Lỗi upload/lưu file ảnh trực tiếp: {exc}") from exc
+
+    if not saved_records:
+        raise HTTPException(status_code=400, detail="Không lưu được cặp ảnh. Kiểm tra định dạng file ảnh.")
+
+    db = SessionLocal()
+    try:
+        for pair_job_id, item, row, saved_record in pair_job_items:
+            pair_summary = {
+                "mode": "direct_image_pair",
+                "upload_mode": upload_mode,
+                "batch_id": job_id,
+                "low_images": len(low_paths),
+                "high_images": len(high_paths),
+                "submitted_pairs": len(reviewed_pairs),
+                "source_pair_id": item["pair_id"],
+            }
             db.add(
-                DBPair(
-                    job_id=job_id,
-                    pair_id=row["pair_id"],
-                    segment_id="direct",
-                    low_idx=row["low_index"],
-                    high_idx=row["high_index"],
-                    selected_high_idx=row["high_index"],
-                    low_path=row["low_path"],
-                    high_path=row["high_path"],
-                    accepted=row["accepted"],
-                    alternatives_json="[]",
+                DBJob(
+                    job_id=pair_job_id,
+                    status="done",
+                    message="Đã lưu cặp ảnh trực tiếp",
+                    video_name=f"direct_image_pair_{pair_job_id}",
+                    submitted_by=submitted_by,
+                    objective_pairs=objective_pairs,
+                    summary_json=json.dumps(pair_summary),
                 )
             )
-        for item in reviewed_pairs:
-            saved_record = saved_by_source_pair.get(item["pair_id"])
-            if not saved_record:
-                continue
+            if row:
+                db.add(
+                    DBPair(
+                        job_id=pair_job_id,
+                        pair_id=row["pair_id"],
+                        segment_id="direct",
+                        low_idx=row["low_index"],
+                        high_idx=row["high_index"],
+                        selected_high_idx=row["high_index"],
+                        low_path=row["low_path"],
+                        high_path=row["high_path"],
+                        low_brightness=row["low_brightness"],
+                        high_brightness=row["high_brightness"],
+                        brightness_gap=row["brightness_gap"],
+                        score=row["score"],
+                        good_matches=row["good_matches"],
+                        inlier_ratio=row["inlier_ratio"],
+                        hog_hits=row["hog_hits"],
+                        accepted=row["accepted"],
+                        alternatives_json=json.dumps(row["alternatives"]),
+                    )
+                )
             db.add(
                 DBReviewedPair(
                     dataset_pair_id=saved_record["pair_id"],
-                    job_id=job_id,
+                    job_id=pair_job_id,
                     submitted_by=submitted_by,
                     source_pair_id=item["pair_id"],
                     low_path=item["low_path"],
                     high_path=item["high_path"],
                     saved_low=saved_record["saved_low"],
                     saved_high=saved_record["saved_high"],
-                    score=None,
+                    score=item.get("score"),
                     human_decision=item.get("human_decision", "accepted_direct")[:20],
                 )
             )
+
+            pair_payload = []
+            if row:
+                pair_payload = [
+                    {
+                        "pair_id": row["pair_id"],
+                        "segment_id": "direct",
+                        "mode": "direct_upload",
+                        "low_idx": row["low_index"],
+                        "high_idx": row["high_index"],
+                        "selected_high_idx": row["high_index"],
+                        "low_path": row["low_path"],
+                        "high_path": row["high_path"],
+                        "low_brightness": row["low_brightness"],
+                        "high_brightness": row["high_brightness"],
+                        "brightness_gap": row["brightness_gap"],
+                        "score": row["score"],
+                        "good_matches": row["good_matches"],
+                        "inlier_ratio": row["inlier_ratio"],
+                        "hog_hits": row["hog_hits"],
+                        "accepted": True,
+                        "alternatives": row["alternatives"],
+                    }
+                ]
+
+            jobs[pair_job_id] = {
+                "status": "done",
+                "message": "Đã lưu cặp ảnh trực tiếp",
+                "pairs": pair_payload,
+                "low_options": [],
+                "high_options": [],
+                "summary": pair_summary,
+                "submitted_by": submitted_by,
+                "objective_pairs": objective_pairs,
+                "saved_count": 1,
+            }
         db.commit()
-        saved_count = db.query(DBReviewedPair).filter(DBReviewedPair.job_id == job_id).count()
-        team_saved_count = db.query(DBReviewedPair).count()
+        job_ids = [pair_job_id for pair_job_id, _, _, _ in pair_job_items]
+        saved_count = len(saved_records)
     except Exception as exc:
         db.rollback()
+        update_drive_upload_progress(progress_id, status="error", error=str(exc))
         raise HTTPException(status_code=500, detail=f"Lỗi lưu metadata cặp ảnh: {exc}") from exc
     finally:
         db.close()
 
-    jobs[job_id]["saved_count"] = saved_count
-    if storage_mode == "cloudinary" and cleanup_after_save():
+    update_drive_upload_progress(progress_id, status="processing", completed_files=progress_total)
+    drive_stats = await run_in_threadpool(dataset_stats)
+    team_saved_count = drive_stats["pair_count"]
+    if storage_mode == "rclone":
         cleanup_job_files(job_id)
+        for pair_job_id in job_ids:
+            cleanup_job_files(pair_job_id)
+    update_drive_upload_progress(
+        progress_id,
+        status="complete",
+        completed_files=progress_total,
+        completed_pairs=len(accepted_pairs),
+    )
 
     return {
-        "job_id": job_id,
+        "job_id": job_ids[0] if job_ids else None,
+        "job_ids": job_ids,
+        "separate_jobs": True,
         "copied": copied,
         "storage": storage_mode,
-        "dataset_dir": "Cloudinary" if storage_mode == "cloudinary" else str(DATASET_DIR),
+        "dataset_dir": remote_dataset_root(),
         "submitted_by": submitted_by,
         "objective_pairs": objective_pairs,
         "saved_count": saved_count,
         "team_objective_pairs": TEAM_OBJECTIVE_PAIRS,
         "team_saved_count": team_saved_count,
         "team_remaining_pairs": max(TEAM_OBJECTIVE_PAIRS - team_saved_count, 0),
-        "source_group": f"direct_image_batch_{job_id}",
+        "team_low_count": drive_stats["low_count"],
+        "team_reference_count": drive_stats["reference_count"],
+        "source_group": f"direct_image_pair_{job_ids[0]}" if job_ids else None,
+        "source_groups": [f"direct_image_pair_{item}" for item in job_ids],
         "saved_pairs": saved_records,
     }
 
@@ -2637,6 +3091,22 @@ def get_frame(job_id: str, path: str):
     return FileResponse(requested)
 
 
+@app.get("/api/storage/file")
+def get_storage_file(path: str):
+    try:
+        temp_path = download_file(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Không đọc được ảnh từ Google Drive: {exc}") from exc
+
+    return FileResponse(
+        temp_path,
+        filename=Path(path).name,
+        background=BackgroundTask(temp_path.unlink, missing_ok=True),
+    )
+
+
 @app.post("/api/jobs/{job_id}/save")
 async def save_pairs(job_id: str, request: Request):
     # Check job folder or DB record existence
@@ -2656,6 +3126,7 @@ async def save_pairs(job_id: str, request: Request):
 
     payload = await request.json()
     reviewed_pairs = payload.get("pairs", [])
+    progress_id = str(payload.get("progress_id") or "").strip()[:80] or None
     submitted_by = jobs.get(job_id, {}).get("submitted_by") or "Không rõ"
     objective_pairs = jobs.get(job_id, {}).get("objective_pairs")
 
@@ -2675,6 +3146,18 @@ async def save_pairs(job_id: str, request: Request):
         item["submitted_by"] = submitted_by
         item["objective_pairs"] = objective_pairs
 
+    accepted_pairs = [item for item in reviewed_pairs if item.get("accepted", True)]
+    progress_total = len(accepted_pairs) * 2
+    update_drive_upload_progress(
+        progress_id,
+        status="uploading",
+        completed_files=0,
+        completed_pairs=0,
+        total_files=progress_total,
+        total_pairs=len(accepted_pairs),
+        current_file=None,
+    )
+
     db = SessionLocal()
     try:
         start_idx = db.query(DBReviewedPair).count()
@@ -2682,8 +3165,17 @@ async def save_pairs(job_id: str, request: Request):
         db.close()
 
     try:
-        copied, saved_records, storage_mode = save_reviewed_outputs(job_id, reviewed_pairs, start_idx)
+        copied, saved_records, storage_mode = await run_in_threadpool(
+            save_reviewed_outputs,
+            job_id,
+            reviewed_pairs,
+            start_idx,
+            progress_id,
+            0,
+            progress_total,
+        )
     except Exception as exc:
+        update_drive_upload_progress(progress_id, status="error", error=str(exc))
         raise HTTPException(status_code=500, detail=f"Lỗi upload/lưu file cặp ảnh: {exc}") from exc
     saved_by_source_pair = {record["source_pair_id"]: record for record in saved_records}
 
@@ -2744,16 +3236,20 @@ async def save_pairs(job_id: str, request: Request):
         jobs[job_id]["submitted_by"] = submitted_by
         jobs[job_id]["objective_pairs"] = objective_pairs
     remaining_pairs = max(int(objective_pairs or 0) - int(saved_count or 0), 0) if objective_pairs else None
-    db = SessionLocal()
-    try:
-        team_saved_count = db.query(DBReviewedPair).count()
-    finally:
-        db.close()
-    if storage_mode == "cloudinary" and cleanup_after_save():
+    update_drive_upload_progress(progress_id, status="processing", completed_files=progress_total)
+    drive_stats = await run_in_threadpool(dataset_stats)
+    team_saved_count = drive_stats["pair_count"]
+    if storage_mode == "rclone":
         cleanup_job_files(job_id)
+    update_drive_upload_progress(
+        progress_id,
+        status="complete",
+        completed_files=progress_total,
+        completed_pairs=len(accepted_pairs),
+    )
     return {
         "copied": copied,
-        "dataset_dir": "Cloudinary" if storage_mode == "cloudinary" else str(DATASET_DIR),
+        "dataset_dir": remote_dataset_root(),
         "storage": storage_mode,
         "submitted_by": submitted_by,
         "objective_pairs": objective_pairs,
@@ -2762,4 +3258,6 @@ async def save_pairs(job_id: str, request: Request):
         "team_objective_pairs": TEAM_OBJECTIVE_PAIRS,
         "team_saved_count": team_saved_count,
         "team_remaining_pairs": max(TEAM_OBJECTIVE_PAIRS - team_saved_count, 0),
+        "team_low_count": drive_stats["low_count"],
+        "team_reference_count": drive_stats["reference_count"],
     }
