@@ -9,6 +9,8 @@ from threading import Lock
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 from sqlalchemy import text
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -23,6 +25,8 @@ from .storage import (
     remote_dataset_root,
     upload_file,
 )
+
+register_heif_opener()
 
 # Initialize database tables on startup
 DB_INIT_ERROR: str | None = None
@@ -45,6 +49,8 @@ executor = ThreadPoolExecutor(max_workers=1)
 jobs: dict[str, dict] = {}
 drive_upload_progress: dict[str, dict] = {}
 drive_upload_progress_lock = Lock()
+matching_progress: dict[str, dict] = {}
+matching_progress_lock = Lock()
 TEAM_OBJECTIVE_PAIRS = 500
 
 
@@ -1201,11 +1207,11 @@ INDEX_HTML = """<!doctype html>
               </div>
               <div class="job-field">
                 <label for="directLowInput">Nhóm ảnh LOW</label>
-                <input id="directLowInput" name="low_images" type="file" accept="image/*" multiple required>
+                <input id="directLowInput" name="low_images" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.heic,.heif,image/png,image/jpeg,image/webp,image/bmp,image/heic,image/heif" multiple required>
               </div>
               <div class="job-field">
                 <label for="directHighInput">Nhóm ảnh Reference (HIGH)</label>
-                <input id="directHighInput" name="high_images" type="file" accept="image/*" multiple required>
+                <input id="directHighInput" name="high_images" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.heic,.heif,image/png,image/jpeg,image/webp,image/bmp,image/heic,image/heif" multiple required>
                 <span class="job-option-note">Hệ thống sẽ chạy matching như pipeline video rồi đề xuất cặp để review.</span>
               </div>
               <div class="job-field">
@@ -1588,11 +1594,18 @@ INDEX_HTML = """<!doctype html>
       addPairBtn.disabled = true;
 
       const body = new FormData(imagePairForm);
+      const matchingProgressId = createProgressId();
+      body.set("matching_progress_id", matchingProgressId);
       for (const [key] of Object.entries(defaultParams)) {
         const input = document.querySelector(`[name="${key}"]`);
         if (input) body.set(key, input.value);
       }
 
+      const stopMatchingProgress = startMatchingProgressPolling(
+        matchingProgressId,
+        directLowFiles.length,
+        directHighFiles.length
+      );
       try {
         const response = await fetch("/api/image-pairs/preview", { method: "POST", body });
         const payload = await parseJsonResponse(response);
@@ -1615,6 +1628,7 @@ INDEX_HTML = """<!doctype html>
       } catch (err) {
         statusEl.innerHTML = `<span class="error-message">Lỗi matching batch ảnh: ${err.message}</span>`;
       } finally {
+        stopMatchingProgress();
         imagePairBtn.disabled = false;
       }
     });
@@ -1788,6 +1802,69 @@ INDEX_HTML = """<!doctype html>
           }
         } catch (err) {
           // The save request still provides the final success/error state.
+        }
+        timer = setTimeout(poll, 500);
+      };
+      timer = setTimeout(poll, 250);
+      return () => {
+        stopped = true;
+        if (timer) clearTimeout(timer);
+      };
+    }
+
+    function renderMatchingProgress(progress, lowCount, referenceCount) {
+      const totalComparisons = Number(progress.total_comparisons || lowCount * referenceCount || 1);
+      const completedComparisons = Math.min(Number(progress.completed_comparisons || 0), totalComparisons);
+      let percent = Math.min(Math.round(20 + (completedComparisons / Math.max(totalComparisons, 1)) * 80), 100);
+      let label = `Đang matching: ${completedComparisons}/${totalComparisons} tổ hợp`;
+      let detail = `${progress.current_low || "LOW"} ↔ ${progress.current_reference || "reference"}`;
+      if (progress.status === "preparing") {
+        const totalFiles = Number(progress.total_files || lowCount + referenceCount);
+        const completedFiles = Number(progress.completed_files || 0);
+        percent = Math.min(Math.round((completedFiles / Math.max(totalFiles, 1)) * 10), 10);
+        label = `Đang đọc/chuyển định dạng ảnh: ${completedFiles}/${totalFiles} file`;
+        detail = progress.current_file || "Đang chuẩn bị...";
+      } else if (progress.status === "analyzing_references") {
+        const totalReferences = Number(progress.total_references || referenceCount || 1);
+        const completedReferences = Number(progress.completed_references || 0);
+        percent = Math.min(Math.round(10 + (completedReferences / Math.max(totalReferences, 1)) * 10), 20);
+        label = `Đang phân tích reference: ${completedReferences}/${totalReferences}`;
+        detail = "Chuẩn bị đặc trưng để matching";
+      } else if (progress.status === "complete") {
+        percent = 100;
+      }
+      statusEl.innerHTML = `
+        <div class="drive-progress">
+          <div class="drive-progress-row">
+            <span>${label}</span>
+            <strong>${percent}%</strong>
+          </div>
+          <div class="drive-progress-track">
+            <div class="drive-progress-bar" style="--progress-percent: ${percent}%"></div>
+          </div>
+          <div class="drive-progress-row">
+            <span>${lowCount} LOW × ${referenceCount} reference</span>
+            <span>${detail}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    function startMatchingProgressPolling(progressId, lowCount, referenceCount) {
+      let stopped = false;
+      let timer = null;
+      renderMatchingProgress({ status: "preparing", completed_files: 0 }, lowCount, referenceCount);
+      const poll = async () => {
+        if (stopped) return;
+        try {
+          const response = await fetch(`/api/matching-progress/${encodeURIComponent(progressId)}`);
+          if (response.ok) {
+            const progress = await response.json();
+            renderMatchingProgress(progress, lowCount, referenceCount);
+            if (progress.status === "complete" || progress.status === "error") return;
+          }
+        } catch (err) {
+          // The preview request still provides the final success/error state.
         }
         timer = setTimeout(poll, 500);
       };
@@ -2289,12 +2366,31 @@ def update_drive_upload_progress(progress_id: str | None, **values) -> None:
         current.update(values)
 
 
+def update_matching_progress(progress_id: str | None, **values) -> None:
+    if not progress_id:
+        return
+    with matching_progress_lock:
+        if progress_id not in matching_progress and len(matching_progress) >= 200:
+            matching_progress.pop(next(iter(matching_progress)))
+        current = matching_progress.setdefault(progress_id, {})
+        current.update(values)
+
+
 @app.get("/api/upload-progress/{progress_id}")
 def get_upload_progress(progress_id: str):
     with drive_upload_progress_lock:
         progress = drive_upload_progress.get(progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy tiến độ upload.")
+        return dict(progress)
+
+
+@app.get("/api/matching-progress/{progress_id}")
+def get_matching_progress(progress_id: str):
+    with matching_progress_lock:
+        progress = matching_progress.get(progress_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy tiến độ matching.")
         return dict(progress)
 
 
@@ -2429,6 +2525,25 @@ def image_suffix(filename: str | None) -> str:
     return suffix if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} else ".png"
 
 
+def save_uploaded_image(image: UploadFile, destination: Path) -> None:
+    source_suffix = Path(image.filename or "").suffix.lower()
+    source_type = (image.content_type or "").lower()
+    is_heif = source_suffix in {".heic", ".heif"} or source_type in {"image/heic", "image/heif"}
+    image.file.seek(0)
+    if not is_heif:
+        with destination.open("wb") as handle:
+            shutil.copyfileobj(image.file, handle)
+        return
+
+    try:
+        with Image.open(image.file) as source:
+            converted = ImageOps.exif_transpose(source).convert("RGB")
+            converted.save(destination, format="PNG", optimize=True)
+    except Exception as exc:
+        filename = Path(image.filename or "không rõ").name
+        raise ValueError(f"Không chuyển được file HEIC/HEIF {filename}; file có thể bị hỏng hoặc sai định dạng.") from exc
+
+
 def valid_preview_dir(preview_id: str) -> Path | None:
     if len(preview_id) != 12 or any(character not in "0123456789abcdef" for character in preview_id.lower()):
         return None
@@ -2439,6 +2554,7 @@ def valid_preview_dir(preview_id: str) -> Path | None:
 @app.post("/api/image-pairs/preview")
 async def preview_image_pairs(request: Request):
     form = await request.form()
+    progress_id = str(form.get("matching_progress_id") or "").strip()[:80] or None
     low_images = [item for item in form.getlist("low_images") if hasattr(item, "file")]
     high_images = [item for item in form.getlist("high_images") if hasattr(item, "file")]
     if not low_images or not high_images:
@@ -2450,24 +2566,71 @@ async def preview_image_pairs(request: Request):
     high_dir = direct_dir / "high"
     low_dir.mkdir(parents=True, exist_ok=True)
     high_dir.mkdir(parents=True, exist_ok=True)
+    total_files = len(low_images) + len(high_images)
+    completed_files = 0
+    update_matching_progress(
+        progress_id,
+        status="preparing",
+        completed_files=0,
+        total_files=total_files,
+        completed_comparisons=0,
+        total_comparisons=len(low_images) * len(high_images),
+    )
     try:
         low_paths = []
         high_paths = []
+        low_names = []
+        high_names = []
         for idx, image in enumerate(low_images):
             path = low_dir / f"low_{idx:04d}{image_suffix(image.filename)}"
-            with path.open("wb") as handle:
-                shutil.copyfileobj(image.file, handle)
+            await run_in_threadpool(save_uploaded_image, image, path)
             low_paths.append(path)
+            low_names.append(Path(image.filename or path.name).name)
+            completed_files += 1
+            update_matching_progress(
+                progress_id,
+                status="preparing",
+                completed_files=completed_files,
+                total_files=total_files,
+                current_file=low_names[-1],
+            )
         for idx, image in enumerate(high_images):
             path = high_dir / f"reference_{idx:04d}{image_suffix(image.filename)}"
-            with path.open("wb") as handle:
-                shutil.copyfileobj(image.file, handle)
+            await run_in_threadpool(save_uploaded_image, image, path)
             high_paths.append(path)
+            high_names.append(Path(image.filename or path.name).name)
+            completed_files += 1
+            update_matching_progress(
+                progress_id,
+                status="preparing",
+                completed_files=completed_files,
+                total_files=total_files,
+                current_file=high_names[-1],
+            )
 
-        result = match_image_groups(low_paths, high_paths, config_from_form(dict(form)))
+        result = await run_in_threadpool(
+            match_image_groups,
+            low_paths,
+            high_paths,
+            config_from_form(dict(form)),
+            low_names=low_names,
+            reference_names=high_names,
+            progress_callback=lambda values: update_matching_progress(progress_id, **values),
+        )
+        update_matching_progress(
+            progress_id,
+            status="complete",
+            completed_comparisons=len(low_paths) * len(high_paths),
+            total_comparisons=len(low_paths) * len(high_paths),
+        )
         return {"preview_id": preview_id, **result}
+    except ValueError as exc:
+        cleanup_job_files(preview_id)
+        update_matching_progress(progress_id, status="error", error=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         cleanup_job_files(preview_id)
+        update_matching_progress(progress_id, status="error", error=str(exc))
         raise HTTPException(status_code=500, detail=f"Lỗi matching ảnh LOW/reference: {exc}") from exc
 
 
@@ -2519,13 +2682,11 @@ async def create_image_pair(request: Request):
         high_paths = []
         for idx, image in enumerate(low_images):
             path = low_dir / f"low_{idx:04d}{image_suffix(image.filename)}"
-            with path.open("wb") as handle:
-                shutil.copyfileobj(image.file, handle)
+            save_uploaded_image(image, path)
             low_paths.append(path)
         for idx, image in enumerate(high_images):
             path = high_dir / f"high_{idx:04d}{image_suffix(image.filename)}"
-            with path.open("wb") as handle:
-                shutil.copyfileobj(image.file, handle)
+            save_uploaded_image(image, path)
             high_paths.append(path)
 
     pairs_raw = str(form.get("pairs_json") or "").strip()

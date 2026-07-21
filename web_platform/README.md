@@ -5,11 +5,13 @@ Web app local để tạo dataset cặp ảnh thiếu sáng/đủ sáng từ vid
 Luồng sử dụng:
 
 1. Tải video lên để pipeline tự tìm cặp, hoặc upload riêng hai nhóm ảnh LOW và reference có sẵn.
+   File HEIC/HEIF sẽ được backend tự động chuyển thành PNG trước khi matching.
 2. Chỉnh tham số pipeline nếu cần.
 3. Review các cặp LOW/HIGH được chọn tự động.
 4. Nếu cặp chưa đúng, đổi **Frame LOW** hoặc **Frame HIGH** bằng dropdown.
 5. Dùng **Thêm cặp thủ công** nếu pipeline bỏ sót một cặp tốt.
 6. Với hai nhóm ảnh có sẵn, app chạy SIFT/edge matching như pipeline video để đề xuất cặp trước; dùng dropdown để chỉnh lại LOW/reference, thêm cặp hoặc loại cặp nếu cần. Chỉ khi bấm **Lưu cặp đã duyệt** thì các cặp accepted mới được lưu lên Google Drive/Supabase. Dropdown **Cách gán job_id / source group** cho phép chọn cả batch dùng chung một `job_id` hoặc mỗi cặp accepted dùng một `job_id` riêng.
+   Trong lúc xử lý, thanh tiến độ hiển thị pha chuyển định dạng, phân tích reference và số tổ hợp LOW/reference đã matching.
 
 Khi lưu, thanh progress hiển thị phần trăm, số file và số cặp đã upload xong lên Google Drive. Tiến độ được cập nhật sau từng lệnh `rclone copyto`.
 

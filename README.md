@@ -3,6 +3,7 @@
 Web platform để upload video, tự tách các cặp ảnh LOW/HIGH, cho user review lại LOW/HIGH thủ công, rồi lưu dataset đã duyệt.
 
 Ngoài video, form upload ảnh nhận riêng hai nhóm LOW/reference, chạy matching để đề xuất cặp trước khi review, rồi cho chọn dùng chung `job_id` hoặc mỗi cặp một `job_id` riêng.
+Ảnh HEIC/HEIF được tự động chuyển thành PNG trên backend trước khi matching và upload lên Drive.
 
 App có tracking cho team và từng video:
 

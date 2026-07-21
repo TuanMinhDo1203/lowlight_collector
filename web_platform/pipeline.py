@@ -5,6 +5,7 @@ import json
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -296,27 +297,96 @@ def candidate_is_valid(good_matches: int, inlier_ratio: float, edge_valid: bool,
     )
 
 
-def match_image_groups(low_paths: list[Path], reference_paths: list[Path], config: PipelineConfig | None = None) -> dict:
+def _read_uploaded_image(path: Path):
+    # imdecode handles image content independently of the filename extension and
+    # avoids OpenCV path handling issues with non-ASCII upload names.
+    try:
+        encoded = np.fromfile(path, dtype=np.uint8)
+    except OSError:
+        return None
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR) if encoded.size else None
+
+
+def _invalid_image_message(side: str, invalid_files: list[tuple[str, int]]) -> str:
+    details = ", ".join(f"{name} ({size} bytes)" for name, size in invalid_files[:5])
+    if len(invalid_files) > 5:
+        details += f", và {len(invalid_files) - 5} file khác"
+    return (
+        f"Không đọc được ảnh {side}: {details}. "
+        "Hãy dùng file PNG, JPEG, WebP, BMP hoặc HEIC/HEIF hợp lệ; AVIF/DNG chưa được hỗ trợ."
+    )
+
+
+def match_image_groups(
+    low_paths: list[Path],
+    reference_paths: list[Path],
+    config: PipelineConfig | None = None,
+    low_names: list[str] | None = None,
+    reference_names: list[str] | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
+) -> dict:
     config = config or PipelineConfig()
     low_records = []
     reference_records = []
+    invalid_low = []
+    invalid_reference = []
     for idx, path in enumerate(low_paths):
-        image = cv2.imread(str(path))
+        image = _read_uploaded_image(path)
         if image is not None:
             low_records.append((idx, path, image, compute_brightness(image)))
+        else:
+            invalid_low.append(((low_names or [])[idx] if low_names and idx < len(low_names) else path.name, path.stat().st_size))
     for idx, path in enumerate(reference_paths):
-        image = cv2.imread(str(path))
+        image = _read_uploaded_image(path)
         if image is not None:
             reference_records.append((idx, path, image, compute_brightness(image)))
-    if not low_records or not reference_records:
-        raise RuntimeError("Không đọc được ảnh LOW hoặc reference hợp lệ để matching.")
+        else:
+            invalid_reference.append(
+                ((reference_names or [])[idx] if reference_names and idx < len(reference_names) else path.name, path.stat().st_size)
+            )
+    if invalid_low:
+        raise ValueError(_invalid_image_message("LOW", invalid_low))
+    if invalid_reference:
+        raise ValueError(_invalid_image_message("reference", invalid_reference))
+
+    total_candidates = len(low_records) * len(reference_records)
+    reference_hog_hits = {}
+    for completed, (reference_idx, _, reference_img, _) in enumerate(reference_records, start=1):
+        reference_hog_hits[reference_idx] = detect_hog_person(reference_img)
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "analyzing_references",
+                    "completed_references": completed,
+                    "total_references": len(reference_records),
+                    "completed_comparisons": 0,
+                    "total_comparisons": total_candidates,
+                }
+            )
 
     candidates = []
+    completed_comparisons = 0
     for low_idx, low_path, low_img, low_brightness in low_records:
         for reference_idx, reference_path, reference_img, reference_brightness in reference_records:
+            low_name = low_names[low_idx] if low_names and low_idx < len(low_names) else low_path.name
+            reference_name = (
+                reference_names[reference_idx]
+                if reference_names and reference_idx < len(reference_names)
+                else reference_path.name
+            )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "matching",
+                        "completed_comparisons": completed_comparisons,
+                        "total_comparisons": total_candidates,
+                        "current_low": low_name,
+                        "current_reference": reference_name,
+                    }
+                )
             _, good_matches, inlier_ratio = sift_check(low_img, reference_img, config)
             edge_valid, edge_stats = edge_structure_check(low_img, reference_img, config)
-            hog_hits = detect_hog_person(reference_img)
+            hog_hits = reference_hog_hits[reference_idx]
             score = structure_score(
                 good_matches,
                 inlier_ratio,
@@ -345,6 +415,17 @@ def match_image_groups(low_paths: list[Path], reference_paths: list[Path], confi
                     and candidate_is_valid(good_matches, inlier_ratio, edge_valid, score, config),
                 }
             )
+            completed_comparisons += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "matching",
+                        "completed_comparisons": completed_comparisons,
+                        "total_comparisons": total_candidates,
+                        "current_low": low_name,
+                        "current_reference": reference_name,
+                    }
+                )
 
     assigned_lows = set()
     assigned_references = set()
@@ -375,8 +456,10 @@ def match_image_groups(low_paths: list[Path], reference_paths: list[Path], confi
                 "selected_high_idx": item["high_idx"],
                 "low_file_index": item["low_idx"],
                 "high_file_index": item["high_idx"],
-                "low_name": low_paths[item["low_idx"]].name,
-                "high_name": reference_paths[item["high_idx"]].name,
+                "low_name": (low_names or [])[item["low_idx"]] if low_names else low_paths[item["low_idx"]].name,
+                "high_name": (reference_names or [])[item["high_idx"]]
+                if reference_names
+                else reference_paths[item["high_idx"]].name,
                 "low_path": item["low_path"],
                 "high_path": item["high_path"],
                 "low_brightness": item["low_brightness"],
@@ -409,7 +492,7 @@ def match_image_groups(low_paths: list[Path], reference_paths: list[Path], confi
             {
                 "idx": idx,
                 "file_index": idx,
-                "name": path.name,
+                "name": low_names[idx] if low_names and idx < len(low_names) else path.name,
                 "path": str(path),
                 "brightness": brightness,
                 "direct_upload": True,
@@ -420,7 +503,7 @@ def match_image_groups(low_paths: list[Path], reference_paths: list[Path], confi
             {
                 "idx": idx,
                 "file_index": idx,
-                "name": path.name,
+                "name": reference_names[idx] if reference_names and idx < len(reference_names) else path.name,
                 "path": str(path),
                 "brightness": brightness,
                 "direct_upload": True,
