@@ -153,8 +153,16 @@ def _list_remote_files(relative_path: str) -> list[str]:
 def dataset_stats() -> dict:
     low_files = _list_remote_files("raw/low")
     reference_files = _list_remote_files("raw/reference")
-    low_keys = {_pair_key(name, ("_low",)) for name in low_files}
-    reference_keys = {_pair_key(name, ("_reference", "_high")) for name in reference_files}
+    low_by_key: dict[str, list[str]] = {}
+    reference_by_key: dict[str, list[str]] = {}
+    for name in low_files:
+        key = _pair_key(name, ("_low",))
+        low_by_key.setdefault(key, []).append(build_remote_path(f"raw/low/{name}"))
+    for name in reference_files:
+        key = _pair_key(name, ("_reference", "_high"))
+        reference_by_key.setdefault(key, []).append(build_remote_path(f"raw/reference/{name}"))
+    low_keys = set(low_by_key)
+    reference_keys = set(reference_by_key)
     paired_keys = low_keys & reference_keys
     return {
         "pair_count": len(paired_keys),
@@ -162,6 +170,13 @@ def dataset_stats() -> dict:
         "reference_count": len(reference_files),
         "unmatched_low_count": len(low_keys - reference_keys),
         "unmatched_reference_count": len(reference_keys - low_keys),
+        "paired_files": {
+            key: {
+                "low": sorted(low_by_key[key]),
+                "reference": sorted(reference_by_key[key]),
+            }
+            for key in paired_keys
+        },
     }
 
 

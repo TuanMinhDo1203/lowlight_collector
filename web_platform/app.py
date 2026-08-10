@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import shutil
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -51,6 +53,8 @@ drive_upload_progress: dict[str, dict] = {}
 drive_upload_progress_lock = Lock()
 matching_progress: dict[str, dict] = {}
 matching_progress_lock = Lock()
+active_preview_saves: set[str] = set()
+active_preview_saves_lock = Lock()
 TEAM_OBJECTIVE_PAIRS = 500
 
 
@@ -681,6 +685,76 @@ INDEX_HTML = """<!doctype html>
       color: #10b981;
     }
 
+    .contributor-stats {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+      display: grid;
+      gap: 10px;
+    }
+
+    .contributor-stats-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+    }
+
+    .contributor-stats-title {
+      color: var(--text-primary);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .contributor-stats-note {
+      color: var(--text-muted);
+      font-size: 11px;
+      text-align: right;
+    }
+
+    .contributor-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 8px 16px;
+    }
+
+    .contributor-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 5px 10px;
+      align-items: center;
+    }
+
+    .contributor-name,
+    .contributor-count {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .contributor-name {
+      overflow-wrap: anywhere;
+    }
+
+    .contributor-count {
+      color: var(--accent-cyan);
+      font-weight: 800;
+    }
+
+    .contributor-track {
+      grid-column: 1 / -1;
+      height: 5px;
+      overflow: hidden;
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    .contributor-bar {
+      height: 100%;
+      width: var(--contributor-percent, 0%);
+      border-radius: inherit;
+      background: var(--accent-gradient);
+    }
+
     @media (max-width: 900px) {
       .objective-progress {
         grid-template-columns: repeat(2, 1fr);
@@ -1212,7 +1286,7 @@ INDEX_HTML = """<!doctype html>
               <div class="job-field">
                 <label for="directHighInput">Nhóm ảnh Reference (HIGH)</label>
                 <input id="directHighInput" name="high_images" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.heic,.heif,image/png,image/jpeg,image/webp,image/bmp,image/heic,image/heif" multiple required>
-                <span class="job-option-note">Hệ thống sẽ chạy matching như pipeline video rồi đề xuất cặp để review.</span>
+                <span class="job-option-note">Hệ thống sắp xếp hai nhóm theo thời gian chụp trong metadata rồi ghép lần lượt để review.</span>
               </div>
               <div class="job-field">
                 <label for="directJobModeInput">Cách gán job_id / source group</label>
@@ -1378,6 +1452,12 @@ INDEX_HTML = """<!doctype html>
               <span class="objective-note">Sau khi bấm lưu</span>
             </div>
           </div>
+          <div class="contributor-stats" id="contributorStats">
+            <div class="contributor-stats-header">
+              <span class="contributor-stats-title">Đóng góp theo người chụp</span>
+              <span class="contributor-stats-note">Đang đối chiếu Google Drive với database...</span>
+            </div>
+          </div>
           <div class="summary-grid" id="summary"></div>
         </div>
 
@@ -1404,7 +1484,16 @@ INDEX_HTML = """<!doctype html>
     let lowOptions = [];
     let highOptions = [];
     let currentJobMeta = { submitted_by: "", objective_pairs: null, saved_count: 0 };
-    let teamStats = { saved_count: 0, objective_pairs: 500, remaining_pairs: 500, low_count: 0, reference_count: 0 };
+    let teamStats = {
+      saved_count: 0,
+      objective_pairs: 500,
+      remaining_pairs: 500,
+      low_count: 0,
+      reference_count: 0,
+      contributors: [],
+      metadata_matched_pair_count: 0,
+      metadata_missing_pair_count: 0
+    };
     let pendingDirectPair = null;
     let directLowFiles = [];
     let directHighFiles = [];
@@ -1420,6 +1509,7 @@ INDEX_HTML = """<!doctype html>
     const summaryEl = document.getElementById("summary");
     const pairsCountEl = document.getElementById("pairsCount");
     const objectiveProgressEl = document.getElementById("objectiveProgress");
+    const contributorStatsEl = document.getElementById("contributorStats");
 
     // File input change event for better UX
     const videoInput = document.getElementById("videoInput");
@@ -1571,6 +1661,7 @@ INDEX_HTML = """<!doctype html>
 
     imagePairForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (imagePairBtn.disabled) return;
       clearPendingDirectBatch();
       directLowFiles = Array.from(document.getElementById("directLowInput").files || []);
       directHighFiles = Array.from(document.getElementById("directHighInput").files || []);
@@ -1586,7 +1677,7 @@ INDEX_HTML = """<!doctype html>
       statusEl.innerHTML = `
         <div class="progress-container">
           <div class="spinner"></div>
-          <span class="progress-text">Đang chạy matching ${directLowFiles.length} ảnh LOW với ${directHighFiles.length} ảnh reference...</span>
+          <span class="progress-text">Đang đọc thời gian chụp và ghép lần lượt ${directLowFiles.length} ảnh LOW với ${directHighFiles.length} ảnh reference...</span>
         </div>
       `;
       imagePairBtn.disabled = true;
@@ -1624,7 +1715,7 @@ INDEX_HTML = """<!doctype html>
         renderObjectiveProgress();
         saveBtn.disabled = currentPairs.length === 0;
         addPairBtn.disabled = lowOptions.length === 0 || highOptions.length === 0;
-        statusEl.innerHTML = `<span class="success-message">Matching hoàn tất: đề xuất ${currentPairs.length} cặp. Hãy review LOW/reference trước khi lưu.</span>`;
+        statusEl.innerHTML = `<span class="success-message">Đã ghép tuần tự theo thời gian chụp: ${currentPairs.length} cặp. Hãy review LOW/reference trước khi lưu.</span>`;
       } catch (err) {
         statusEl.innerHTML = `<span class="error-message">Lỗi matching batch ảnh: ${err.message}</span>`;
       } finally {
@@ -1691,6 +1782,46 @@ INDEX_HTML = """<!doctype html>
       summaryEl.innerHTML = Object.entries(summary).map(([key, value]) => `<span>${key}: ${value}</span>`).join("");
     }
 
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, character => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      })[character]);
+    }
+
+    function renderContributorStats() {
+      if (!contributorStatsEl) return;
+      const contributors = Array.isArray(teamStats.contributors) ? teamStats.contributors : [];
+      const matched = Number(teamStats.metadata_matched_pair_count || 0);
+      const missing = Number(teamStats.metadata_missing_pair_count || 0);
+      const total = Number(teamStats.saved_count || 0);
+      const rows = contributors.length
+        ? contributors.map(item => {
+            const count = Number(item.pair_count || 0);
+            const percentage = Math.max(0, Math.min(Number(item.percentage || 0), 100));
+            return `
+              <div class="contributor-row">
+                <span class="contributor-name">${escapeHtml(item.name || "Không rõ")}</span>
+                <span class="contributor-count">${count} cặp · ${percentage.toFixed(1)}%</span>
+                <div class="contributor-track">
+                  <div class="contributor-bar" style="--contributor-percent: ${percentage}%"></div>
+                </div>
+              </div>
+            `;
+          }).join("")
+        : `<span class="contributor-stats-note">Chưa có cặp ảnh trên Drive.</span>`;
+      contributorStatsEl.innerHTML = `
+        <div class="contributor-stats-header">
+          <span class="contributor-stats-title">Đóng góp theo người chụp</span>
+          <span class="contributor-stats-note">Đối chiếu Drive: ${matched}/${total} cặp có metadata${missing ? `, ${missing} cặp chưa xác định` : ""}</span>
+        </div>
+        <div class="contributor-list">${rows}</div>
+      `;
+    }
+
     function renderObjectiveProgress(savedOverride = null) {
       if (!objectiveProgressEl) return;
       const submitter = currentJobMeta.submitted_by || "Chưa nhập";
@@ -1730,6 +1861,7 @@ INDEX_HTML = """<!doctype html>
           <span class="objective-note">Cặp của job hiện tại</span>
         </div>
       `;
+      renderContributorStats();
     }
 
     renderObjectiveProgress();
@@ -1744,7 +1876,10 @@ INDEX_HTML = """<!doctype html>
           objective_pairs: Number(stats.objective_pairs || 500),
           remaining_pairs: Number(stats.remaining_pairs || 0),
           low_count: Number(stats.low_count || 0),
-          reference_count: Number(stats.reference_count || 0)
+          reference_count: Number(stats.reference_count || 0),
+          contributors: Array.isArray(stats.contributors) ? stats.contributors : [],
+          metadata_matched_pair_count: Number(stats.metadata_matched_pair_count || 0),
+          metadata_missing_pair_count: Number(stats.metadata_missing_pair_count || 0)
         };
         renderObjectiveProgress();
       } catch (err) {
@@ -1813,10 +1948,10 @@ INDEX_HTML = """<!doctype html>
     }
 
     function renderMatchingProgress(progress, lowCount, referenceCount) {
-      const totalComparisons = Number(progress.total_comparisons || lowCount * referenceCount || 1);
+      const totalComparisons = Number(progress.total_comparisons || Math.min(lowCount, referenceCount) || 1);
       const completedComparisons = Math.min(Number(progress.completed_comparisons || 0), totalComparisons);
-      let percent = Math.min(Math.round(20 + (completedComparisons / Math.max(totalComparisons, 1)) * 80), 100);
-      let label = `Đang matching: ${completedComparisons}/${totalComparisons} tổ hợp`;
+      let percent = Math.min(Math.round(10 + (completedComparisons / Math.max(totalComparisons, 1)) * 90), 100);
+      let label = `Đang ghép theo thời gian chụp: ${completedComparisons}/${totalComparisons} cặp`;
       let detail = `${progress.current_low || "LOW"} ↔ ${progress.current_reference || "reference"}`;
       if (progress.status === "preparing") {
         const totalFiles = Number(progress.total_files || lowCount + referenceCount);
@@ -1824,12 +1959,6 @@ INDEX_HTML = """<!doctype html>
         percent = Math.min(Math.round((completedFiles / Math.max(totalFiles, 1)) * 10), 10);
         label = `Đang đọc/chuyển định dạng ảnh: ${completedFiles}/${totalFiles} file`;
         detail = progress.current_file || "Đang chuẩn bị...";
-      } else if (progress.status === "analyzing_references") {
-        const totalReferences = Number(progress.total_references || referenceCount || 1);
-        const completedReferences = Number(progress.completed_references || 0);
-        percent = Math.min(Math.round(10 + (completedReferences / Math.max(totalReferences, 1)) * 10), 20);
-        label = `Đang phân tích reference: ${completedReferences}/${totalReferences}`;
-        detail = "Chuẩn bị đặc trưng để matching";
       } else if (progress.status === "complete") {
         percent = 100;
       }
@@ -1843,7 +1972,7 @@ INDEX_HTML = """<!doctype html>
             <div class="drive-progress-bar" style="--progress-percent: ${percent}%"></div>
           </div>
           <div class="drive-progress-row">
-            <span>${lowCount} LOW × ${referenceCount} reference</span>
+            <span>${lowCount} LOW + ${referenceCount} reference</span>
             <span>${detail}</span>
           </div>
         </div>
@@ -1900,7 +2029,8 @@ INDEX_HTML = """<!doctype html>
 
     function frameOptionLabel(frame) {
       if (frame.direct_upload) {
-        return `${frame.idx + 1}. ${frame.name}`;
+        const captureTime = frame.capture_time ? ` · ${String(frame.capture_time).replace("T", " ")}` : " · không có time metadata";
+        return `${frame.idx + 1}. ${frame.name}${captureTime}`;
       }
       return `idx ${frame.idx} | sáng ${Number(frame.brightness).toFixed(1)}`;
     }
@@ -1931,6 +2061,24 @@ INDEX_HTML = """<!doctype html>
       return Number.isFinite(number) ? number.toFixed(digits) : fallback;
     }
 
+    function captureTimeText(pair) {
+      if (!pair.match_method) return "";
+      const lowTime = pair.low_capture_time ? String(pair.low_capture_time).replace("T", " ") : "fallback thứ tự upload";
+      const highTime = pair.high_capture_time ? String(pair.high_capture_time).replace("T", " ") : "fallback thứ tự upload";
+      const gap = pair.capture_time_gap_seconds === null || pair.capture_time_gap_seconds === undefined
+        ? ""
+        : ` · lệch ${Number(pair.capture_time_gap_seconds).toFixed(1)}s`;
+      return `Time: ${lowTime} ↔ ${highTime}${gap}`;
+    }
+
+    function refreshCaptureTimeGap(pair) {
+      const lowTimestamp = pair.low_capture_time ? Date.parse(pair.low_capture_time) : NaN;
+      const highTimestamp = pair.high_capture_time ? Date.parse(pair.high_capture_time) : NaN;
+      pair.capture_time_gap_seconds = Number.isFinite(lowTimestamp) && Number.isFinite(highTimestamp)
+        ? Math.abs(highTimestamp - lowTimestamp) / 1000
+        : null;
+    }
+
     function updatePairMeta(article, pair) {
       article.querySelector(".gap-value").textContent = `Chênh sáng: ${fmtNumber(pair.brightness_gap)}`;
       article.querySelector(".score-value").textContent = `Điểm: ${pair.score === null ? "Tự chọn" : Number(pair.score).toFixed(2)}`;
@@ -1941,6 +2089,8 @@ INDEX_HTML = """<!doctype html>
         hog.textContent = `Cảnh báo: Phát hiện người (${pair.hog_hits || 0})`;
         hog.style.display = Number(pair.hog_hits || 0) > 0 ? "inline-block" : "none";
       }
+      const captureTime = article.querySelector(".capture-time-value");
+      if (captureTime) captureTime.textContent = captureTimeText(pair);
     }
 
     function renderPairs(pairs) {
@@ -1977,7 +2127,7 @@ INDEX_HTML = """<!doctype html>
                   <select class="alt-select">${highSelectOptions}</select>
                 </label>
                 <button type="button" class="reject-btn">Loại Cặp này</button>
-                <div class="direct-note">Batch upload trực tiếp: ${pendingDirectPair && pendingDirectPair.separateJobs ? "mỗi cặp được lưu thành một job/source group riêng để phân biệt từng cảnh." : "các cặp lưu trong lần này dùng chung một job/video group để tránh leakage khi chia train/val/test."}</div>
+                <div class="direct-note">Ghép tuần tự theo thời gian chụp metadata. ${pendingDirectPair && pendingDirectPair.separateJobs ? "Mỗi cặp được lưu thành một job/source group riêng để phân biệt từng cảnh." : "Các cặp lưu trong lần này dùng chung một job/video group để tránh leakage khi chia train/val/test."}</div>
         ` : `
                 <label>Thay đổi Frame LOW
                   <select class="low-select">${lowSelectOptions}</select>
@@ -2015,6 +2165,7 @@ INDEX_HTML = """<!doctype html>
                 <span class="gap-value">Chênh sáng: ${fmtNumber(pair.brightness_gap)}</span>
                 <span class="matches-value">Matches: ${pair.good_matches === null ? "Thủ công" : pair.good_matches}</span>
                 <span class="inlier-value">Inlier: ${pair.inlier_ratio === null ? "Thủ công" : Number(pair.inlier_ratio).toFixed(2)}</span>
+                ${pair.match_method ? `<span class="capture-time-value">${captureTimeText(pair)}</span>` : ""}
                 <span class="warn hog-value" style="${Number(pair.hog_hits || 0) > 0 ? "" : "display:none"}">Cảnh báo: Phát hiện người (${pair.hog_hits || 0})</span>
               </div>
             </div>
@@ -2033,6 +2184,8 @@ INDEX_HTML = """<!doctype html>
           pair.low_brightness = low.brightness;
           pair.low_file_index = low.file_index;
           pair.low_name = low.name;
+          pair.low_capture_time = low.capture_time || null;
+          refreshCaptureTimeGap(pair);
           pair.brightness_gap = Number(pair.high_brightness || 0) - Number(pair.low_brightness || 0);
           article.querySelector(".low-img").src = imageSrc(low.path);
           article.querySelector(".low-caption").textContent = pair.mode === "direct_upload" ? `LOW: ${low.name}` : `LOW: #${low.idx} - Sáng: ${fmtNumber(low.brightness)}`;
@@ -2054,6 +2207,8 @@ INDEX_HTML = """<!doctype html>
           pair.high_brightness = frame.brightness;
           pair.high_file_index = frame.file_index;
           pair.high_name = frame.name;
+          pair.high_capture_time = frame.capture_time || null;
+          refreshCaptureTimeGap(pair);
           pair.brightness_gap = Number(pair.high_brightness || 0) - Number(pair.low_brightness || 0);
           pair.score = alt ? alt.score : null;
           pair.good_matches = alt ? alt.good_matches : null;
@@ -2151,6 +2306,7 @@ INDEX_HTML = """<!doctype html>
           saved_count: payload.saved_count || payload.copied || 1
         };
         teamStats = {
+          ...teamStats,
           saved_count: Number(payload.team_saved_count || 0),
           objective_pairs: Number(payload.team_objective_pairs || 500),
           remaining_pairs: Number(payload.team_remaining_pairs || 0),
@@ -2169,6 +2325,7 @@ INDEX_HTML = """<!doctype html>
             Đã lưu thành công ${payload.copied} cặp ảnh trực tiếp ${payload.separate_jobs ? `thành ${payload.job_ids ? payload.job_ids.length : 1} job riêng` : `trong cùng batch ${payload.job_id}`}. Tiến độ team: ${payload.team_saved_count}/${payload.team_objective_pairs}.
           </span>
         `;
+        fetchTeamStats();
       } catch (err) {
         saveBtn.disabled = false;
         statusEl.innerHTML = `<span class="error-message">Lỗi khi lưu cặp ảnh trực tiếp: ${err.message}</span>`;
@@ -2212,6 +2369,7 @@ INDEX_HTML = """<!doctype html>
         renderObjectiveProgress(currentJobMeta.saved_count);
         if (payload.team_objective_pairs) {
           teamStats = {
+            ...teamStats,
             saved_count: Number(payload.team_saved_count || 0),
             objective_pairs: Number(payload.team_objective_pairs || 500),
             remaining_pairs: Number(payload.team_remaining_pairs || 0),
@@ -2226,6 +2384,7 @@ INDEX_HTML = """<!doctype html>
             Đã lưu thành công ${payload.copied} cặp đã duyệt vào thư mục kết quả.${remainingText}
           </span>
         `;
+        fetchTeamStats();
       } catch (err) {
         statusEl.innerHTML = `<span class="error-message">Lỗi khi lưu cặp ảnh: ${err.message}</span>`;
       } finally {
@@ -2344,6 +2503,64 @@ def get_stats():
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Không đọc được tiến độ từ Google Drive: {exc}") from exc
     saved_count = drive_stats["pair_count"]
+    paired_files = drive_stats["paired_files"]
+    low_to_key = {
+        path: key
+        for key, paths in paired_files.items()
+        for path in paths["low"]
+    }
+    reference_to_key = {
+        path: key
+        for key, paths in paired_files.items()
+        for path in paths["reference"]
+    }
+    selected_rows: dict[str, DBReviewedPair] = {}
+    db = SessionLocal()
+    try:
+        if paired_files:
+            rows = (
+                db.query(DBReviewedPair)
+                .filter(
+                    DBReviewedPair.saved_low.in_(low_to_key),
+                    DBReviewedPair.saved_high.in_(reference_to_key),
+                )
+                .order_by(DBReviewedPair.id.desc())
+                .all()
+            )
+            for row in rows:
+                pair_key = low_to_key.get(row.saved_low)
+                if pair_key and reference_to_key.get(row.saved_high) == pair_key:
+                    selected_rows.setdefault(pair_key, row)
+    finally:
+        db.close()
+
+    contributor_counts: Counter[str] = Counter()
+    contributor_labels: dict[str, str] = {}
+    for row in selected_rows.values():
+        submitted_by = (row.submitted_by or "").strip()
+        if not submitted_by or submitted_by.casefold() in {"unknown", "không rõ"}:
+            submitted_by = "Không rõ"
+        normalized_name = submitted_by.casefold()
+        contributor_labels.setdefault(normalized_name, submitted_by)
+        contributor_counts[normalized_name] += 1
+
+    missing_metadata_count = saved_count - len(selected_rows)
+    if missing_metadata_count:
+        unknown_key = "không rõ"
+        contributor_labels[unknown_key] = "Không rõ"
+        contributor_counts[unknown_key] += missing_metadata_count
+
+    contributors = [
+        {
+            "name": contributor_labels[key],
+            "pair_count": count,
+            "percentage": round(count * 100 / saved_count, 1) if saved_count else 0.0,
+        }
+        for key, count in sorted(
+            contributor_counts.items(),
+            key=lambda item: (-item[1], contributor_labels[item[0]].casefold()),
+        )
+    ]
     return {
         "objective_pairs": TEAM_OBJECTIVE_PAIRS,
         "saved_count": saved_count,
@@ -2352,6 +2569,9 @@ def get_stats():
         "reference_count": drive_stats["reference_count"],
         "unmatched_low_count": drive_stats["unmatched_low_count"],
         "unmatched_reference_count": drive_stats["unmatched_reference_count"],
+        "contributors": contributors,
+        "metadata_matched_pair_count": len(selected_rows),
+        "metadata_missing_pair_count": missing_metadata_count,
         "source": "google_drive",
     }
 
@@ -2431,6 +2651,18 @@ def save_reviewed_outputs(
     copied = 0
     if not rclone_enabled():
         raise RuntimeError("Rclone is not ready. Configure rclone before saving reviewed pairs.")
+
+    accepted_sources = [
+        (Path(item["low_path"]), Path(item["high_path"]))
+        for item in reviewed_pairs
+        if item.get("accepted", True)
+    ]
+    missing_sources = [path for paths in accepted_sources for path in paths if not path.is_file()]
+    if missing_sources:
+        missing_names = ", ".join(path.name for path in missing_sources[:5])
+        raise FileNotFoundError(
+            f"Preview ảnh không còn đầy đủ ({missing_names}). Hãy chạy matching lại trước khi lưu."
+        )
 
     storage_mode = "rclone"
 
@@ -2525,7 +2757,61 @@ def image_suffix(filename: str | None) -> str:
     return suffix if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} else ".png"
 
 
-def save_uploaded_image(image: UploadFile, destination: Path) -> None:
+def _parse_capture_datetime(exif) -> dict:
+    raw_value = next((exif.get(tag) for tag in (36867, 36868, 306) if exif.get(tag)), None)
+    if not raw_value:
+        return {"capture_time": None, "capture_timestamp": None}
+    if isinstance(raw_value, bytes):
+        raw_value = raw_value.decode("utf-8", errors="ignore")
+    raw_value = str(raw_value).strip().rstrip("\x00")
+    parsed = None
+    for date_format in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed = datetime.strptime(raw_value[:19], date_format)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return {"capture_time": None, "capture_timestamp": None}
+
+    subsecond = exif.get(37521) or exif.get(37520)
+    if subsecond:
+        digits = "".join(character for character in str(subsecond) if character.isdigit())[:6]
+        if digits:
+            parsed = parsed.replace(microsecond=int(digits.ljust(6, "0")))
+
+    offset_value = exif.get(36881) or exif.get(36880)
+    if offset_value:
+        if isinstance(offset_value, bytes):
+            offset_value = offset_value.decode("utf-8", errors="ignore")
+        offset_text = str(offset_value).strip().rstrip("\x00")
+        try:
+            sign = 1 if offset_text[0] == "+" else -1
+            hours, minutes = (int(part) for part in offset_text[1:].split(":", 1))
+            parsed = parsed.replace(tzinfo=timezone(sign * timedelta(hours=hours, minutes=minutes)))
+        except (IndexError, TypeError, ValueError):
+            pass
+
+    return {
+        "capture_time": parsed.isoformat(),
+        "capture_timestamp": parsed.timestamp(),
+    }
+
+
+def extract_capture_metadata(image: UploadFile) -> dict:
+    image.file.seek(0)
+    try:
+        with Image.open(image.file) as source:
+            metadata = _parse_capture_datetime(source.getexif())
+    except Exception:
+        metadata = {"capture_time": None, "capture_timestamp": None}
+    finally:
+        image.file.seek(0)
+    return metadata
+
+
+def save_uploaded_image(image: UploadFile, destination: Path) -> dict:
+    capture_metadata = extract_capture_metadata(image)
     source_suffix = Path(image.filename or "").suffix.lower()
     source_type = (image.content_type or "").lower()
     is_heif = source_suffix in {".heic", ".heif"} or source_type in {"image/heic", "image/heif"}
@@ -2533,7 +2819,7 @@ def save_uploaded_image(image: UploadFile, destination: Path) -> None:
     if not is_heif:
         with destination.open("wb") as handle:
             shutil.copyfileobj(image.file, handle)
-        return
+        return capture_metadata
 
     try:
         with Image.open(image.file) as source:
@@ -2542,6 +2828,7 @@ def save_uploaded_image(image: UploadFile, destination: Path) -> None:
     except Exception as exc:
         filename = Path(image.filename or "không rõ").name
         raise ValueError(f"Không chuyển được file HEIC/HEIF {filename}; file có thể bị hỏng hoặc sai định dạng.") from exc
+    return capture_metadata
 
 
 def valid_preview_dir(preview_id: str) -> Path | None:
@@ -2549,6 +2836,22 @@ def valid_preview_dir(preview_id: str) -> Path | None:
         return None
     preview_dir = (JOB_DIR / preview_id).resolve()
     return preview_dir if preview_dir.parent == JOB_DIR.resolve() and preview_dir.is_dir() else None
+
+
+def claim_preview_for_save(preview_id: str) -> Path:
+    with active_preview_saves_lock:
+        if preview_id in active_preview_saves:
+            raise HTTPException(status_code=409, detail="Preview batch ảnh này đang được lưu.")
+        preview_dir = valid_preview_dir(preview_id)
+        if preview_dir is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy preview batch ảnh. Hãy chạy matching lại.")
+        active_preview_saves.add(preview_id)
+        return preview_dir
+
+
+def release_preview_save(preview_id: str) -> None:
+    with active_preview_saves_lock:
+        active_preview_saves.discard(preview_id)
 
 
 @app.post("/api/image-pairs/preview")
@@ -2574,18 +2877,21 @@ async def preview_image_pairs(request: Request):
         completed_files=0,
         total_files=total_files,
         completed_comparisons=0,
-        total_comparisons=len(low_images) * len(high_images),
+        total_comparisons=min(len(low_images), len(high_images)),
     )
     try:
         low_paths = []
         high_paths = []
         low_names = []
         high_names = []
+        low_capture_metadata = []
+        high_capture_metadata = []
         for idx, image in enumerate(low_images):
             path = low_dir / f"low_{idx:04d}{image_suffix(image.filename)}"
-            await run_in_threadpool(save_uploaded_image, image, path)
+            capture_metadata = await run_in_threadpool(save_uploaded_image, image, path)
             low_paths.append(path)
             low_names.append(Path(image.filename or path.name).name)
+            low_capture_metadata.append(capture_metadata)
             completed_files += 1
             update_matching_progress(
                 progress_id,
@@ -2596,9 +2902,10 @@ async def preview_image_pairs(request: Request):
             )
         for idx, image in enumerate(high_images):
             path = high_dir / f"reference_{idx:04d}{image_suffix(image.filename)}"
-            await run_in_threadpool(save_uploaded_image, image, path)
+            capture_metadata = await run_in_threadpool(save_uploaded_image, image, path)
             high_paths.append(path)
             high_names.append(Path(image.filename or path.name).name)
+            high_capture_metadata.append(capture_metadata)
             completed_files += 1
             update_matching_progress(
                 progress_id,
@@ -2615,13 +2922,15 @@ async def preview_image_pairs(request: Request):
             config_from_form(dict(form)),
             low_names=low_names,
             reference_names=high_names,
+            low_capture_metadata=low_capture_metadata,
+            reference_capture_metadata=high_capture_metadata,
             progress_callback=lambda values: update_matching_progress(progress_id, **values),
         )
         update_matching_progress(
             progress_id,
             status="complete",
-            completed_comparisons=len(low_paths) * len(high_paths),
-            total_comparisons=len(low_paths) * len(high_paths),
+            completed_comparisons=min(len(low_paths), len(high_paths)),
+            total_comparisons=min(len(low_paths), len(high_paths)),
         )
         return {"preview_id": preview_id, **result}
     except ValueError as exc:
@@ -2636,24 +2945,33 @@ async def preview_image_pairs(request: Request):
 
 @app.delete("/api/image-pairs/preview/{preview_id}")
 def delete_image_pair_preview(preview_id: str):
-    preview_dir = valid_preview_dir(preview_id)
-    if preview_dir is None:
-        raise HTTPException(status_code=404, detail="Không tìm thấy preview batch ảnh.")
-    cleanup_job_files(preview_id)
+    with active_preview_saves_lock:
+        if preview_id in active_preview_saves:
+            raise HTTPException(status_code=409, detail="Preview đang được upload nên chưa thể xóa.")
+        preview_dir = valid_preview_dir(preview_id)
+        if preview_dir is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy preview batch ảnh.")
+        cleanup_job_files(preview_id)
     return {"deleted": True}
 
 
 @app.post("/api/image-pairs")
 async def create_image_pair(request: Request):
     form = await request.form()
+    preview_id = str(form.get("preview_id") or "").strip().lower()
+    preview_dir = claim_preview_for_save(preview_id) if preview_id else None
+    try:
+        return await create_image_pair_from_form(form, preview_id, preview_dir)
+    finally:
+        if preview_id:
+            release_preview_save(preview_id)
+
+
+async def create_image_pair_from_form(form, preview_id: str, preview_dir: Path | None):
     submitted_by = str(form.get("submitted_by") or "").strip() or "Không rõ"
     objective_pairs = parse_objective(form.get("objective_pairs"))
     separate_jobs = str(form.get("separate_jobs") or "").lower() in {"1", "true", "yes", "on"}
     progress_id = str(form.get("progress_id") or "").strip()[:80] or None
-    preview_id = str(form.get("preview_id") or "").strip().lower()
-    preview_dir = valid_preview_dir(preview_id) if preview_id else None
-    if preview_id and preview_dir is None:
-        raise HTTPException(status_code=404, detail="Không tìm thấy preview batch ảnh.")
     job_id = preview_id or uuid.uuid4().hex[:12]
     direct_dir = JOB_DIR / job_id / "direct_pair"
     direct_dir.mkdir(parents=True, exist_ok=True)

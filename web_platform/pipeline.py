@@ -323,199 +323,140 @@ def match_image_groups(
     config: PipelineConfig | None = None,
     low_names: list[str] | None = None,
     reference_names: list[str] | None = None,
+    low_capture_metadata: list[dict] | None = None,
+    reference_capture_metadata: list[dict] | None = None,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> dict:
-    config = config or PipelineConfig()
-    low_records = []
-    reference_records = []
-    invalid_low = []
-    invalid_reference = []
-    for idx, path in enumerate(low_paths):
-        image = _read_uploaded_image(path)
-        if image is not None:
-            low_records.append((idx, path, image, compute_brightness(image)))
-        else:
-            invalid_low.append(((low_names or [])[idx] if low_names and idx < len(low_names) else path.name, path.stat().st_size))
-    for idx, path in enumerate(reference_paths):
-        image = _read_uploaded_image(path)
-        if image is not None:
-            reference_records.append((idx, path, image, compute_brightness(image)))
-        else:
-            invalid_reference.append(
-                ((reference_names or [])[idx] if reference_names and idx < len(reference_names) else path.name, path.stat().st_size)
+    del config  # Kept in the signature for compatibility with existing callers.
+
+    def build_records(paths: list[Path], names: list[str] | None, capture_metadata: list[dict] | None):
+        records = []
+        invalid = []
+        for idx, path in enumerate(paths):
+            image = _read_uploaded_image(path)
+            name = names[idx] if names and idx < len(names) else path.name
+            if image is None:
+                invalid.append((name, path.stat().st_size))
+                continue
+            metadata = capture_metadata[idx] if capture_metadata and idx < len(capture_metadata) else {}
+            timestamp = metadata.get("capture_timestamp")
+            records.append(
+                {
+                    "idx": idx,
+                    "path": path,
+                    "name": name,
+                    "brightness": compute_brightness(image),
+                    "capture_time": metadata.get("capture_time"),
+                    "capture_timestamp": float(timestamp) if timestamp is not None else None,
+                }
             )
+        return records, invalid
+
+    low_records, invalid_low = build_records(low_paths, low_names, low_capture_metadata)
+    reference_records, invalid_reference = build_records(
+        reference_paths,
+        reference_names,
+        reference_capture_metadata,
+    )
     if invalid_low:
         raise ValueError(_invalid_image_message("LOW", invalid_low))
     if invalid_reference:
         raise ValueError(_invalid_image_message("reference", invalid_reference))
 
-    total_candidates = len(low_records) * len(reference_records)
-    reference_hog_hits = {}
-    for completed, (reference_idx, _, reference_img, _) in enumerate(reference_records, start=1):
-        reference_hog_hits[reference_idx] = detect_hog_person(reference_img)
+    def time_order(record: dict):
+        timestamp = record["capture_timestamp"]
+        return (timestamp is None, timestamp if timestamp is not None else 0.0, record["idx"])
+
+    ordered_lows = sorted(low_records, key=time_order)
+    ordered_references = sorted(reference_records, key=time_order)
+    pair_count = min(len(ordered_lows), len(ordered_references))
+    pairs = []
+    for pair_id, (low, reference) in enumerate(zip(ordered_lows, ordered_references)):
         if progress_callback:
             progress_callback(
                 {
-                    "status": "analyzing_references",
-                    "completed_references": completed,
-                    "total_references": len(reference_records),
-                    "completed_comparisons": 0,
-                    "total_comparisons": total_candidates,
+                    "status": "matching",
+                    "completed_comparisons": pair_id,
+                    "total_comparisons": pair_count,
+                    "current_low": low["name"],
+                    "current_reference": reference["name"],
                 }
             )
-
-    candidates = []
-    completed_comparisons = 0
-    for low_idx, low_path, low_img, low_brightness in low_records:
-        for reference_idx, reference_path, reference_img, reference_brightness in reference_records:
-            low_name = low_names[low_idx] if low_names and low_idx < len(low_names) else low_path.name
-            reference_name = (
-                reference_names[reference_idx]
-                if reference_names and reference_idx < len(reference_names)
-                else reference_path.name
-            )
-            if progress_callback:
-                progress_callback(
-                    {
-                        "status": "matching",
-                        "completed_comparisons": completed_comparisons,
-                        "total_comparisons": total_candidates,
-                        "current_low": low_name,
-                        "current_reference": reference_name,
-                    }
-                )
-            _, good_matches, inlier_ratio = sift_check(low_img, reference_img, config)
-            edge_valid, edge_stats = edge_structure_check(low_img, reference_img, config)
-            hog_hits = reference_hog_hits[reference_idx]
-            score = structure_score(
-                good_matches,
-                inlier_ratio,
-                edge_valid,
-                edge_stats,
-                0,
-                0,
-                hog_hits,
-                config,
-            )
-            brightness_gap = reference_brightness - low_brightness
-            candidates.append(
-                {
-                    "low_idx": low_idx,
-                    "high_idx": reference_idx,
-                    "low_path": str(low_path),
-                    "high_path": str(reference_path),
-                    "low_brightness": low_brightness,
-                    "high_brightness": reference_brightness,
-                    "brightness_gap": brightness_gap,
-                    "score": score,
-                    "good_matches": good_matches,
-                    "inlier_ratio": inlier_ratio,
-                    "hog_hits": hog_hits,
-                    "valid": brightness_gap >= config.min_brightness_gap
-                    and candidate_is_valid(good_matches, inlier_ratio, edge_valid, score, config),
-                }
-            )
-            completed_comparisons += 1
-            if progress_callback:
-                progress_callback(
-                    {
-                        "status": "matching",
-                        "completed_comparisons": completed_comparisons,
-                        "total_comparisons": total_candidates,
-                        "current_low": low_name,
-                        "current_reference": reference_name,
-                    }
-                )
-
-    assigned_lows = set()
-    assigned_references = set()
-    selected = []
-    for candidate in sorted(candidates, key=lambda item: (item["valid"], item["score"]), reverse=True):
-        if candidate["low_idx"] in assigned_lows or candidate["high_idx"] in assigned_references:
-            continue
-        selected.append(candidate)
-        assigned_lows.add(candidate["low_idx"])
-        assigned_references.add(candidate["high_idx"])
-        if len(selected) >= min(len(low_records), len(reference_records)):
-            break
-
-    pairs = []
-    for pair_id, item in enumerate(selected):
-        alternatives = sorted(
-            (candidate for candidate in candidates if candidate["low_idx"] == item["low_idx"]),
-            key=lambda candidate: (candidate["valid"], candidate["score"]),
-            reverse=True,
-        )[: config.alternatives_per_low]
+        low_timestamp = low["capture_timestamp"]
+        reference_timestamp = reference["capture_timestamp"]
+        time_gap = (
+            abs(reference_timestamp - low_timestamp)
+            if low_timestamp is not None and reference_timestamp is not None
+            else None
+        )
         pairs.append(
             {
                 "pair_id": pair_id,
-                "segment_id": "direct_match",
+                "segment_id": "metadata_time",
                 "mode": "direct_upload",
-                "low_idx": item["low_idx"],
-                "high_idx": item["high_idx"],
-                "selected_high_idx": item["high_idx"],
-                "low_file_index": item["low_idx"],
-                "high_file_index": item["high_idx"],
-                "low_name": (low_names or [])[item["low_idx"]] if low_names else low_paths[item["low_idx"]].name,
-                "high_name": (reference_names or [])[item["high_idx"]]
-                if reference_names
-                else reference_paths[item["high_idx"]].name,
-                "low_path": item["low_path"],
-                "high_path": item["high_path"],
-                "low_brightness": item["low_brightness"],
-                "high_brightness": item["high_brightness"],
-                "brightness_gap": item["brightness_gap"],
-                "score": item["score"],
-                "good_matches": item["good_matches"],
-                "inlier_ratio": item["inlier_ratio"],
-                "hog_hits": item["hog_hits"],
+                "match_method": "metadata_time_sequential",
+                "low_idx": low["idx"],
+                "high_idx": reference["idx"],
+                "selected_high_idx": reference["idx"],
+                "low_file_index": low["idx"],
+                "high_file_index": reference["idx"],
+                "low_name": low["name"],
+                "high_name": reference["name"],
+                "low_path": str(low["path"]),
+                "high_path": str(reference["path"]),
+                "low_brightness": low["brightness"],
+                "high_brightness": reference["brightness"],
+                "brightness_gap": reference["brightness"] - low["brightness"],
+                "low_capture_time": low["capture_time"],
+                "high_capture_time": reference["capture_time"],
+                "capture_time_gap_seconds": time_gap,
+                "score": None,
+                "good_matches": None,
+                "inlier_ratio": None,
+                "hog_hits": None,
                 "accepted": True,
-                "alternatives": [
-                    {
-                        "high_idx": alternative["high_idx"],
-                        "high_path": alternative["high_path"],
-                        "high_brightness": alternative["high_brightness"],
-                        "brightness_gap": alternative["brightness_gap"],
-                        "score": alternative["score"],
-                        "good_matches": alternative["good_matches"],
-                        "inlier_ratio": alternative["inlier_ratio"],
-                        "hog_hits": alternative["hog_hits"],
-                    }
-                    for alternative in alternatives
-                ],
+                "alternatives": [],
             }
         )
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "matching",
+                    "completed_comparisons": pair_id + 1,
+                    "total_comparisons": pair_count,
+                    "current_low": low["name"],
+                    "current_reference": reference["name"],
+                }
+            )
 
+    def option(record: dict):
+        return {
+            "idx": record["idx"],
+            "file_index": record["idx"],
+            "name": record["name"],
+            "path": str(record["path"]),
+            "brightness": record["brightness"],
+            "capture_time": record["capture_time"],
+            "direct_upload": True,
+        }
+
+    low_metadata_count = sum(record["capture_timestamp"] is not None for record in low_records)
+    reference_metadata_count = sum(record["capture_timestamp"] is not None for record in reference_records)
     return {
         "pairs": pairs,
-        "low_options": [
-            {
-                "idx": idx,
-                "file_index": idx,
-                "name": low_names[idx] if low_names and idx < len(low_names) else path.name,
-                "path": str(path),
-                "brightness": brightness,
-                "direct_upload": True,
-            }
-            for idx, path, _, brightness in low_records
-        ],
-        "high_options": [
-            {
-                "idx": idx,
-                "file_index": idx,
-                "name": reference_names[idx] if reference_names and idx < len(reference_names) else path.name,
-                "path": str(path),
-                "brightness": brightness,
-                "direct_upload": True,
-            }
-            for idx, path, _, brightness in reference_records
-        ],
+        "low_options": [option(record) for record in ordered_lows],
+        "high_options": [option(record) for record in ordered_references],
         "summary": {
-            "mode": "direct_group_matching",
+            "mode": "metadata_time_sequential",
             "low_images": len(low_records),
             "reference_images": len(reference_records),
-            "candidates": len(candidates),
+            "low_with_capture_time": low_metadata_count,
+            "reference_with_capture_time": reference_metadata_count,
+            "fallback_input_order": (len(low_records) - low_metadata_count)
+            + (len(reference_records) - reference_metadata_count),
             "selected_pairs": len(pairs),
+            "unpaired_low": max(len(low_records) - len(pairs), 0),
+            "unpaired_reference": max(len(reference_records) - len(pairs), 0),
         },
     }
 
